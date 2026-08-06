@@ -235,6 +235,7 @@ preflight_remote_gpu() {
 }
 
 preflight_remote_access() {
+  local require_unjoined="${1:-true}"
   local index target password user
 
   for index in "${!WORKER_IPS[@]}"; do
@@ -249,7 +250,7 @@ preflight_remote_access() {
     if [[ "$user" != 'root' ]] && ! printf '%s\n' "$password" | SSHPASS="$password" sshpass -e ssh "${SSH_OPTIONS[@]}" "$target" "sudo -S -p '' true"; then
       die "Configured account cannot run sudo on $target with the same password."
     fi
-    if ! remote_privileged_command "$index" 'test ! -e /etc/kubernetes/kubelet.conf'; then
+    if [[ "$require_unjoined" == 'true' ]] && ! remote_privileged_command "$index" 'test ! -e /etc/kubernetes/kubelet.conf'; then
       die "Worker $target already has Kubernetes kubelet configuration. Refusing to overwrite it."
     fi
     if [[ "$INSTALL_NVIDIA_STACK" == 'true' ]]; then
@@ -615,7 +616,7 @@ install_gpu_operator() {
 }
 
 install_dynamo_platform() {
-  local resource images
+  local chart_url chart_metadata resource images
 
   if [[ "$INSTALL_DYNAMO_PLATFORM" != 'true' ]]; then
     return 0
@@ -624,11 +625,15 @@ install_dynamo_platform() {
   lineprint
   printstyle "Installing exact Dynamo Platform v${DYNAMO_PLATFORM_VERSION} ...\n" info
 
+  chart_url="https://helm.ngc.nvidia.com/nvidia/ai-dynamo/charts/dynamo-platform-${DYNAMO_PLATFORM_VERSION}.tgz"
+  chart_metadata="$(helm show chart "$chart_url")" || die "Dynamo Platform chart v${DYNAMO_PLATFORM_VERSION} was not found at the NVIDIA release URL."
+  grep -Fxq 'name: dynamo-platform' <<< "$chart_metadata" || die 'Downloaded Dynamo chart has an unexpected name.'
+  grep -Fxq "version: ${DYNAMO_PLATFORM_VERSION}" <<< "$chart_metadata" || die 'Downloaded Dynamo chart version does not match cluster.env.'
+
   helm upgrade --install dynamo-platform \
-    'oci://helm.ngc.nvidia.com/nvidia/ai-dynamo/charts/dynamo-platform' \
+    "$chart_url" \
     --namespace "$DYNAMO_NAMESPACE" \
     --create-namespace \
-    --version "$DYNAMO_PLATFORM_VERSION" \
     --values "$DYNAMO_PLATFORM_VALUES_FILE" \
     --wait \
     --timeout=15m
@@ -644,6 +649,34 @@ install_dynamo_platform() {
   grep -Fq "kubernetes-operator:${DYNAMO_PLATFORM_VERSION}" <<< "$images" || \
     die "Dynamo Kubernetes Operator image is not pinned to ${DYNAMO_PLATFORM_VERSION}."
   printstyle 'Dynamo Platform and cluster-wide Operator installation succeeded.\n\n' success
+}
+
+resume_dynamo_installation() {
+  lineprint
+  printstyle 'Resuming from the Dynamo Platform stage without reinstalling Kubernetes or the workers ...\n' info
+
+  [[ -f /etc/kubernetes/admin.conf ]] || die 'Cannot resume: /etc/kubernetes/admin.conf was not found.'
+  export KUBECONFIG=/etc/kubernetes/admin.conf
+  command -v kubectl >/dev/null 2>&1 || die 'Cannot resume: kubectl is not installed.'
+  command -v helm >/dev/null 2>&1 || die 'Cannot resume: Helm is not installed.'
+  command -v sshpass >/dev/null 2>&1 || die 'Cannot resume: sshpass is not installed.'
+  command -v ssh >/dev/null 2>&1 || die 'Cannot resume: ssh is not installed.'
+  kubectl get --raw='/readyz' --request-timeout=10s 2>/dev/null | grep -Fxq ok || die 'Cannot resume: the Kubernetes API is not ready.'
+  helm version --short | grep -Fq "v${HELM_VERSION}" || die "Cannot resume: Helm v${HELM_VERSION} is not installed."
+
+  preflight_remote_access false
+  verify_cluster
+  if [[ "$INSTALL_NVIDIA_STACK" == 'true' ]]; then
+    helm status gpu-operator -n gpu-operator >/dev/null || die 'Cannot resume: the GPU Operator release is not healthy.'
+    wait_for_cluster_policy
+    verify_gpu_resources
+  fi
+  install_dynamo_platform
+  prepull_dynamo_vllm_runtime
+
+  lineprint
+  printstyle 'Dynamo resume completed successfully. No DGD or inference workload was applied.\n' success
+  printstyle "Prepared runtime: ${DYNAMO_VLLM_IMAGE} (bundled vLLM ${DYNAMO_VLLM_VERSION}).\n" success
 }
 
 prepull_dynamo_vllm_runtime() {
@@ -811,12 +844,19 @@ cleanup_local_temp_paths() {
   done
 }
 
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   die 'Please run this script as root.'
 fi
-if (( $# != 0 )); then
-  die 'This bootstrap does not accept command-line options. Edit cluster.env instead.'
-fi
+BOOTSTRAP_MODE='full'
+case "$#:${1:-}" in
+  0:) ;;
+  1:--resume-dynamo) BOOTSTRAP_MODE='resume-dynamo' ;;
+  *) die 'Usage: k8s-cluster-bootstrap.sh [--resume-dynamo]' ;;
+esac
 
 SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
@@ -906,35 +946,39 @@ case "$NODE_ROLE" in
     join_worker_node
     ;;
   control-plane)
-    [[ ! -e /etc/kubernetes/admin.conf ]] || die 'An existing Kubernetes control plane was detected. Refusing to overwrite it.'
     collect_workers
     if [[ "$INSTALL_NVIDIA_STACK" == 'true' && "$WORKER_COUNT" == '0' ]]; then
       die 'INSTALL_NVIDIA_STACK=true requires at least one worker.'
     fi
-    install_orchestration_dependencies
-    preflight_remote_access
-    install_node_components
-    initialize_control_plane
-    install_calico
-    install_metrics_server
+    if [[ "$BOOTSTRAP_MODE" == 'resume-dynamo' ]]; then
+      resume_dynamo_installation
+    else
+      [[ ! -e /etc/kubernetes/admin.conf ]] || die 'An existing Kubernetes control plane was detected. Refusing to overwrite it. Use --resume-dynamo only when a previous run stopped at the Dynamo stage.'
+      install_orchestration_dependencies
+      preflight_remote_access
+      install_node_components
+      initialize_control_plane
+      install_calico
+      install_metrics_server
 
-    lineprint
-    printstyle "Provisioning and joining ${WORKER_COUNT} worker node(s) over SSH ...\n" info
-    JOIN_COMMAND="$(kubeadm token create --print-join-command) --cri-socket=${CRI_SOCKET}"
-    [[ -n "$JOIN_COMMAND" ]] || die 'Failed to create the worker join command.'
-    for index in "${!WORKER_IPS[@]}"; do
-      install_remote_worker "$index" "$JOIN_COMMAND"
-    done
-    verify_cluster
-    if [[ "$INSTALL_NVIDIA_STACK" == 'true' || "$INSTALL_DYNAMO_PLATFORM" == 'true' ]]; then
-      install_helm
+      lineprint
+      printstyle "Provisioning and joining ${WORKER_COUNT} worker node(s) over SSH ...\n" info
+      JOIN_COMMAND="$(kubeadm token create --print-join-command) --cri-socket=${CRI_SOCKET}"
+      [[ -n "$JOIN_COMMAND" ]] || die 'Failed to create the worker join command.'
+      for index in "${!WORKER_IPS[@]}"; do
+        install_remote_worker "$index" "$JOIN_COMMAND"
+      done
+      verify_cluster
+      if [[ "$INSTALL_NVIDIA_STACK" == 'true' || "$INSTALL_DYNAMO_PLATFORM" == 'true' ]]; then
+        install_helm
+      fi
+      install_gpu_operator
+      install_dynamo_platform
+      prepull_dynamo_vllm_runtime
+      lineprint
+      printstyle 'Full bootstrap completed successfully. No DGD or inference workload was applied.\n' success
+      printstyle "Prepared runtime: ${DYNAMO_VLLM_IMAGE} (bundled vLLM ${DYNAMO_VLLM_VERSION}).\n" success
     fi
-    install_gpu_operator
-    install_dynamo_platform
-    prepull_dynamo_vllm_runtime
-    lineprint
-    printstyle 'Full bootstrap completed successfully. No DGD or inference workload was applied.\n' success
-    printstyle "Prepared runtime: ${DYNAMO_VLLM_IMAGE} (bundled vLLM ${DYNAMO_VLLM_VERSION}).\n" success
     ;;
   *)
     die 'NODE_ROLE must be control-plane. The worker role is reserved for internal remote execution.'
