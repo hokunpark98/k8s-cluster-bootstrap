@@ -90,3 +90,4 @@ $RECYCLE.BIN/
 
 # Local cluster configuration can contain SSH credentials.
 cluster.env
+cluster-bootstrap-report.txt

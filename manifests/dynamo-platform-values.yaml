@@ -1,5 +1,60 @@
-# Cluster-wide is the supported production mode. DGD and model settings are
-# intentionally not part of the platform installation.
+# Infrastructure only: cluster-wide operator plus NATS JetStream. DGD, model,
+# Frontend, EPP, planner, and serving-worker settings belong to experiments.
+global:
+  etcd:
+    install: false
+  nats:
+    install: true
+  kai-scheduler:
+    install: false
+    enabled: false
+  volcano-scheduler:
+    enabled: false
+  grove:
+    install: false
+    enabled: false
+
 dynamo-operator:
+  enabled: true
+  discoveryBackend: kubernetes
   namespaceRestriction:
     enabled: false
+  controllerManager:
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: pactllm-role
+                  operator: In
+                  values:
+                    - platform
+  dynamo:
+    istio:
+      enabled: false
+    serviceMesh:
+      enabled: false
+
+nats:
+  config:
+    cluster:
+      enabled: false
+    jetstream:
+      enabled: true
+      fileStore:
+        enabled: true
+      memoryStore:
+        enabled: false
+  podTemplate:
+    merge:
+      spec:
+        nodeSelector:
+          pactllm-role: platform
+        tolerations:
+          - key: node-role.kubernetes.io/control-plane
+            operator: Exists
+            effect: NoSchedule

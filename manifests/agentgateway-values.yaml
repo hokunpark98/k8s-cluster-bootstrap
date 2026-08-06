@@ -1,0 +1,25 @@
+# Install only the agentgateway controller and GAIE integration. An experiment
+# later creates Gateway, HTTPRoute, InferencePool, EPP, and exposure resources.
+inferenceExtension:
+  enabled: true
+
+controller:
+  replicaCount: 1
+  horizontalPodAutoscaler: {}
+  verticalPodAutoscaler: {}
+
+nodeSelector:
+  pactllm-role: platform
+
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
