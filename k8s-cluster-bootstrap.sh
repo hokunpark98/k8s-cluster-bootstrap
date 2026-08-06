@@ -63,17 +63,13 @@ validate_bool() {
   [[ "$value" == 'true' || "$value" == 'false' ]] || die "$name must be true or false."
 }
 
-valid_cluster_id() {
-  [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
-}
-
 require_config_value() {
   local name="$1"
   [[ -n "${!name:-}" ]] || die "Required configuration value is empty: $name"
 }
 
 load_config() {
-  local line key value config_mode
+  local line key value config_mode legacy_cluster_id_warned='false'
 
   [[ -f "$CONFIG_FILE" ]] || die "Configuration file not found: $CONFIG_FILE. Copy cluster.env.example to cluster.env first."
 
@@ -100,7 +96,13 @@ load_config() {
     fi
 
     case "$key" in
-      NODE_ROLE|CLUSTER_ID|KUBELET_NODE_IP|KUBERNETES_VERSION|CONTAINERD_VERSION|CALICO_VERSION|HELM_VERSION|CONTROL_PLANE_IP|POD_CIDR|INSTALL_CALICO|INSTALL_METRICS_SERVER|METRICS_SERVER_VERSION|REGULAR_USER_HOME|GPU_WORKER_COUNT|JOIN_COMMAND_BASE64|INSTALL_NVIDIA_STACK|NVIDIA_DRIVER_VERSION|NVIDIA_CONTAINER_TOOLKIT_VERSION|NVIDIA_GPU_MODEL|NVIDIA_GPU_MEMORY_MIB|NVIDIA_GPU_COUNT_PER_WORKER|GPU_OPERATOR_VERSION|INSTALL_DYNAMO_PLATFORM|DYNAMO_PLATFORM_VERSION|DYNAMO_VLLM_VERSION|DYNAMO_VLLM_IMAGE|DYNAMO_NAMESPACE|DYNAMO_NATS_STORAGE_CLASS|DYNAMO_NATS_STORAGE_SIZE|DYNAMO_NATS_STORAGE_PATH|PREPULL_DYNAMO_VLLM_IMAGE|INSTALL_GATEWAY_FOUNDATION|GATEWAY_API_VERSION|GAIE_VERSION|AGENTGATEWAY_VERSION|AGENTGATEWAY_NAMESPACE)
+      CLUSTER_ID)
+        if [[ "$legacy_cluster_id_warned" == 'false' ]]; then
+          printstyle 'Ignoring deprecated CLUSTER_ID from cluster.env; cluster identity is derived from configured hosts and live Kubernetes state.\n' warning
+          legacy_cluster_id_warned='true'
+        fi
+        ;;
+      NODE_ROLE|KUBELET_NODE_IP|KUBERNETES_VERSION|CONTAINERD_VERSION|CALICO_VERSION|HELM_VERSION|CONTROL_PLANE_IP|POD_CIDR|INSTALL_CALICO|INSTALL_METRICS_SERVER|METRICS_SERVER_VERSION|REGULAR_USER_HOME|GPU_WORKER_COUNT|JOIN_COMMAND_BASE64|INSTALL_NVIDIA_STACK|NVIDIA_DRIVER_VERSION|NVIDIA_CONTAINER_TOOLKIT_VERSION|NVIDIA_GPU_MODEL|NVIDIA_GPU_MEMORY_MIB|NVIDIA_GPU_COUNT_PER_WORKER|GPU_OPERATOR_VERSION|INSTALL_DYNAMO_PLATFORM|DYNAMO_PLATFORM_VERSION|DYNAMO_VLLM_VERSION|DYNAMO_VLLM_IMAGE|DYNAMO_NAMESPACE|DYNAMO_NATS_STORAGE_CLASS|DYNAMO_NATS_STORAGE_SIZE|DYNAMO_NATS_STORAGE_PATH|PREPULL_DYNAMO_VLLM_IMAGE|INSTALL_GATEWAY_FOUNDATION|GATEWAY_API_VERSION|GAIE_VERSION|AGENTGATEWAY_VERSION|AGENTGATEWAY_NAMESPACE)
         printf -v "$key" '%s' "$value"
         ;;
       *)
@@ -155,19 +157,6 @@ local_kubernetes_state_exists() {
     fi
   done
   return 1
-}
-
-ensure_cluster_id() {
-  if [[ -z "$CLUSTER_ID" ]]; then
-    [[ "$NODE_ROLE" == 'control-plane' ]] || die 'Worker configuration is missing CLUSTER_ID.'
-    [[ "$BOOTSTRAP_MODE" == 'full' && ! -e "$NODE_MARKER_FILE" ]] && ! local_kubernetes_state_exists || \
-      die 'CLUSTER_ID is empty, but existing cluster state was detected. Refusing to invent a new identity; restore the matching cluster.env.'
-    CLUSTER_ID="$(tr 'A-F' 'a-f' < /proc/sys/kernel/random/uuid)"
-    valid_cluster_id "$CLUSTER_ID" || die 'Failed to generate a valid cluster ID.'
-    persist_config_value CLUSTER_ID "$CLUSTER_ID"
-    printstyle "Generated and saved cluster ID ${CLUSTER_ID} in cluster.env.\n" success
-  fi
-  valid_cluster_id "$CLUSTER_ID" || die 'CLUSTER_ID must be a lowercase RFC 4122 UUID.'
 }
 
 prompt_if_empty() {
@@ -248,9 +237,9 @@ validate_fixed_research_stack() {
     'DYNAMO_VLLM_VERSION=0.23.0'
     'DYNAMO_VLLM_IMAGE=nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.3.0'
     'DYNAMO_NAMESPACE=dynamo-system'
-    'DYNAMO_NATS_STORAGE_CLASS=pactllm-local-nats'
+    'DYNAMO_NATS_STORAGE_CLASS=prrw-local-nats'
     'DYNAMO_NATS_STORAGE_SIZE=10Gi'
-    'DYNAMO_NATS_STORAGE_PATH=/var/lib/pactllm/dynamo-nats'
+    'DYNAMO_NATS_STORAGE_PATH=/var/lib/prrw/dynamo-nats'
     'GATEWAY_API_VERSION=1.5.1'
     'GAIE_VERSION=1.2.1'
     'AGENTGATEWAY_VERSION=1.0.0'
@@ -329,81 +318,6 @@ host_owns_ipv4() {
   ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "$expected_ip"
 }
 
-validate_node_marker_file() {
-  local expected_role="$1"
-  local expected_ip="$2"
-
-  [[ -f "$NODE_MARKER_FILE" && ! -L "$NODE_MARKER_FILE" ]] || return 1
-  [[ "$(stat -c '%u:%g:%a' "$NODE_MARKER_FILE")" == '0:0:600' ]] || return 1
-  grep -Fxq "CLUSTER_ID=${CLUSTER_ID}" "$NODE_MARKER_FILE" &&
-    grep -Fxq "NODE_ROLE=${expected_role}" "$NODE_MARKER_FILE" &&
-    grep -Fxq "NODE_IP=${expected_ip}" "$NODE_MARKER_FILE" &&
-    grep -Fxq "KUBERNETES_VERSION=${KUBERNETES_VERSION}" "$NODE_MARKER_FILE" &&
-    grep -Fxq 'CLEANUP_STATE=active' "$NODE_MARKER_FILE"
-}
-
-control_plane_initialized_state() {
-  awk -F= '$1 == "CONTROL_PLANE_INITIALIZED" { print $2; exit }' "$NODE_MARKER_FILE"
-}
-
-set_control_plane_initialized() {
-  local temp_file
-
-  validate_node_marker_file platform "$CONTROL_PLANE_IP" || \
-    die 'Cannot update an invalid control-plane bootstrap marker.'
-  temp_file="$(mktemp)"
-  LOCAL_TEMP_PATHS+=("$temp_file")
-  awk '
-    /^CONTROL_PLANE_INITIALIZED=/ {
-      if (!done) print "CONTROL_PLANE_INITIALIZED=true"
-      done = 1
-      next
-    }
-    { print }
-    END { if (!done) print "CONTROL_PLANE_INITIALIZED=true" }
-  ' "$NODE_MARKER_FILE" > "$temp_file"
-  install -o root -g root -m 0600 "$temp_file" "$NODE_MARKER_FILE"
-}
-
-validate_cleaned_node_marker_file() {
-  local expected_role="$1"
-  local expected_ip="$2"
-  local expected_cluster_id="${3:-$CLUSTER_ID}"
-
-  [[ -f "$NODE_MARKER_FILE" && ! -L "$NODE_MARKER_FILE" ]] || return 1
-  [[ "$(stat -c '%u:%g:%a' "$NODE_MARKER_FILE")" == '0:0:600' ]] || return 1
-  grep -Fxq "CLUSTER_ID=${expected_cluster_id}" "$NODE_MARKER_FILE" &&
-    grep -Fxq "NODE_ROLE=${expected_role}" "$NODE_MARKER_FILE" &&
-    grep -Fxq "NODE_IP=${expected_ip}" "$NODE_MARKER_FILE" &&
-    grep -Fxq "KUBERNETES_VERSION=${KUBERNETES_VERSION}" "$NODE_MARKER_FILE" &&
-    grep -Fxq 'CLEANUP_STATE=cleaned' "$NODE_MARKER_FILE"
-}
-
-write_node_marker() {
-  local role="$1"
-  local node_ip="$2"
-  local temp_file
-
-  if [[ -e "$NODE_MARKER_FILE" ]]; then
-    validate_cleaned_node_marker_file "$role" "$node_ip" || \
-      die "An active or foreign bootstrap marker already exists at $NODE_MARKER_FILE. Use --resume or the matching cleanup first."
-  fi
-  install -d -o root -g root -m 0700 "$NODE_MARKER_DIR"
-  temp_file="$(mktemp)"
-  LOCAL_TEMP_PATHS+=("$temp_file")
-  {
-    printf 'CLUSTER_ID=%s\n' "$CLUSTER_ID"
-    printf 'NODE_ROLE=%s\n' "$role"
-    printf 'NODE_IP=%s\n' "$node_ip"
-    printf 'KUBERNETES_VERSION=%s\n' "$KUBERNETES_VERSION"
-    printf 'CLEANUP_STATE=active\n'
-    if [[ "$role" == 'platform' ]]; then
-      printf 'CONTROL_PLANE_INITIALIZED=false\n'
-    fi
-  } > "$temp_file"
-  install -o root -g root -m 0600 "$temp_file" "$NODE_MARKER_FILE"
-}
-
 verify_local_host_preflight() {
   local require_unjoined="$1"
   local os_id os_version architecture hostname_short ntp_synced
@@ -425,10 +339,6 @@ verify_local_host_preflight() {
   LOCAL_HOSTNAME="$hostname_short"
 
   if [[ "$require_unjoined" == 'true' ]]; then
-    if [[ -e "$NODE_MARKER_FILE" ]]; then
-      validate_cleaned_node_marker_file platform "$CONTROL_PLANE_IP" || \
-        die "An active or foreign bootstrap marker exists at $NODE_MARKER_FILE. Use --resume or the matching cleanup first."
-    fi
     ! local_kubernetes_state_exists || die 'Existing or partial Kubernetes state was detected on the control-plane host. Use the matching cleanup first.'
     if command -v helm >/dev/null 2>&1 || [[ -e /usr/local/bin/helm ]]; then
       die 'Helm is already installed. This bootstrap only manages a clean host without a pre-existing Helm binary.'
@@ -439,28 +349,7 @@ verify_local_host_preflight() {
       [[ -d "$REGULAR_USER_HOME" ]] || die "REGULAR_USER_HOME does not exist: $REGULAR_USER_HOME"
       [[ ! -e "$REGULAR_USER_HOME/.kube/config" ]] || die "Refusing to overwrite an existing kubeconfig: $REGULAR_USER_HOME/.kube/config"
     fi
-  else
-    validate_node_marker_file platform "$CONTROL_PLANE_IP" || die 'The local bootstrap marker does not match this cluster, platform role, and control-plane IP.'
   fi
-}
-
-stage_node_markers() {
-  local index role ip command staged=0
-
-  write_node_marker platform "$CONTROL_PLANE_IP"
-  for index in "${!WORKER_IPS[@]}"; do
-    role="${WORKER_ROLES[$index]}"
-    ip="${WORKER_IPS[$index]}"
-    command="install -d -o root -g root -m 0700 '${NODE_MARKER_DIR}'; umask 077; printf '%s\\n' 'CLUSTER_ID=${CLUSTER_ID}' 'NODE_ROLE=${role}' 'NODE_IP=${ip}' 'KUBERNETES_VERSION=${KUBERNETES_VERSION}' 'CLEANUP_STATE=active' > '${NODE_MARKER_FILE}'; chown root:root '${NODE_MARKER_FILE}'; chmod 0600 '${NODE_MARKER_FILE}'"
-    if ! remote_privileged_command "$index" "$command" || ! verify_remote_marker "$index"; then
-      for ((staged = 0; staged <= index; staged++)); do
-        remote_privileged_command "$staged" "rm -rf -- '${NODE_MARKER_DIR}'" >/dev/null 2>&1 || true
-      done
-      rm -rf -- "$NODE_MARKER_DIR"
-      die "Failed to stage the bootstrap marker on ${WORKER_USERS[$index]}@${ip}. No cluster installation was started."
-    fi
-  done
-  printstyle "Staged cluster identity ${CLUSTER_ID} on the platform and all four GPU workers.\n" success
 }
 
 prepare_ssh_state() {
@@ -468,26 +357,6 @@ prepare_ssh_state() {
   touch "$SSH_KNOWN_HOSTS_FILE"
   chown root:root "$SSH_KNOWN_HOSTS_FILE"
   chmod 0600 "$SSH_KNOWN_HOSTS_FILE"
-}
-
-verify_remote_marker() {
-  local index="$1"
-  local role ip command
-
-  role="${WORKER_ROLES[$index]}"
-  ip="${WORKER_IPS[$index]}"
-  command="test -f '${NODE_MARKER_FILE}' && test ! -L '${NODE_MARKER_FILE}' && test \"\$(stat -c '%u:%g:%a' '${NODE_MARKER_FILE}')\" = '0:0:600' && grep -Fxq 'CLUSTER_ID=${CLUSTER_ID}' '${NODE_MARKER_FILE}' && grep -Fxq 'NODE_ROLE=${role}' '${NODE_MARKER_FILE}' && grep -Fxq 'NODE_IP=${ip}' '${NODE_MARKER_FILE}' && grep -Fxq 'KUBERNETES_VERSION=${KUBERNETES_VERSION}' '${NODE_MARKER_FILE}' && grep -Fxq 'CLEANUP_STATE=active' '${NODE_MARKER_FILE}'"
-  remote_privileged_command "$index" "$command"
-}
-
-verify_remote_cleaned_marker() {
-  local index="$1"
-  local role ip command
-
-  role="${WORKER_ROLES[$index]}"
-  ip="${WORKER_IPS[$index]}"
-  command="test -f '${NODE_MARKER_FILE}' && test ! -L '${NODE_MARKER_FILE}' && test \"\$(stat -c '%u:%g:%a' '${NODE_MARKER_FILE}')\" = '0:0:600' && grep -Fxq 'CLUSTER_ID=${CLUSTER_ID}' '${NODE_MARKER_FILE}' && grep -Fxq 'NODE_ROLE=${role}' '${NODE_MARKER_FILE}' && grep -Fxq 'NODE_IP=${ip}' '${NODE_MARKER_FILE}' && grep -Fxq 'KUBERNETES_VERSION=${KUBERNETES_VERSION}' '${NODE_MARKER_FILE}' && grep -Fxq 'CLEANUP_STATE=cleaned' '${NODE_MARKER_FILE}'"
-  remote_privileged_command "$index" "$command"
 }
 
 preflight_remote_gpu() {
@@ -563,13 +432,6 @@ preflight_remote_access() {
     if [[ "$require_unjoined" == 'true' ]] && ! remote_privileged_command "$index" \
       'for path in /etc/kubernetes /var/lib/kubelet /var/lib/etcd /etc/cni/net.d /var/lib/cni /var/lib/calico; do if [ -e "$path" ] && { [ ! -d "$path" ] || [ -n "$(find "$path" -mindepth 1 -print -quit 2>/dev/null)" ]; }; then exit 1; fi; done'; then
       die "Worker $target already has existing or partial Kubernetes state. Refusing to overwrite it."
-    fi
-    if [[ "$require_unjoined" == 'true' ]]; then
-      if ! remote_privileged_command "$index" "test ! -e '${NODE_MARKER_FILE}'"; then
-        verify_remote_cleaned_marker "$index" || die "Worker $target has an active or foreign bootstrap marker. Use --resume or the matching cleanup first."
-      fi
-    else
-      verify_remote_marker "$index" || die "Worker $target has no matching root-owned cluster marker. Refusing to resume against it."
     fi
     if [[ "$INSTALL_NVIDIA_STACK" == 'true' ]]; then
       preflight_remote_gpu "$index"
@@ -784,31 +646,6 @@ configure_kubeconfig() {
   fi
 }
 
-cluster_identity_configmap_matches() {
-  local identity
-
-  identity="$(KUBECONFIG=/etc/kubernetes/admin.conf kubectl -n kube-system get configmap pactllm-cluster-identity \
-    -o jsonpath='{.data.cluster_id}{"|"}{.data.control_plane_ip}{"|"}{.data.kubernetes_version}' 2>/dev/null || true)"
-  [[ "$identity" == "${CLUSTER_ID}|${CONTROL_PLANE_IP}|${KUBERNETES_VERSION}" ]]
-}
-
-record_cluster_identity_configmap() {
-  KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f - <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: pactllm-cluster-identity
-  namespace: kube-system
-  labels:
-    app.kubernetes.io/managed-by: pactllm-bootstrap
-data:
-  cluster_id: "${CLUSTER_ID}"
-  control_plane_ip: "${CONTROL_PLANE_IP}"
-  kubernetes_version: "${KUBERNETES_VERSION}"
-EOF
-  cluster_identity_configmap_matches || die 'Failed to persist the Kubernetes API cluster identity.'
-}
-
 initialize_control_plane() {
   local init_args
 
@@ -827,8 +664,6 @@ initialize_control_plane() {
   fi
   kubeadm init "${init_args[@]}"
   configure_kubeconfig
-  record_cluster_identity_configmap
-  set_control_plane_initialized
   printstyle 'Control plane initialized.\n\n' success
 }
 
@@ -897,8 +732,7 @@ label_platform_node() {
 
   control_plane_node="$(node_name_for_ip "$CONTROL_PLANE_IP")" || die "No Kubernetes node owns control-plane IP $CONTROL_PLANE_IP."
   kubectl label node "$control_plane_node" \
-    pactllm-role=platform \
-    pactllm-cluster-id="$CLUSTER_ID" \
+    prrw-role=platform \
     nvidia.com/gpu.deploy.operands=false \
     --overwrite
 }
@@ -907,7 +741,7 @@ pin_system_deployment_to_platform() {
   local deployment="$1"
 
   kubectl -n kube-system patch deployment "$deployment" --type=strategic -p \
-    '{"spec":{"template":{"spec":{"nodeSelector":{"pactllm-role":"platform"},"tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}}}}' >/dev/null
+    '{"spec":{"template":{"spec":{"nodeSelector":{"prrw-role":"platform"},"tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}}}}' >/dev/null
 }
 
 pin_core_cluster_services() {
@@ -922,8 +756,7 @@ label_cluster_nodes() {
   printstyle 'Applying fixed research node roles before GPU Operator installation ...\n' info
   control_plane_node="$(node_name_for_ip "$CONTROL_PLANE_IP")" || die "No Kubernetes node owns control-plane IP $CONTROL_PLANE_IP."
   kubectl label node "$control_plane_node" \
-    pactllm-role=platform \
-    pactllm-cluster-id="$CLUSTER_ID" \
+    prrw-role=platform \
     nvidia.com/gpu.deploy.operands=false \
     --overwrite
 
@@ -931,18 +764,15 @@ label_cluster_nodes() {
     worker_node="$(node_name_for_ip "${WORKER_IPS[$index]}")" || die "No Kubernetes node owns worker IP ${WORKER_IPS[$index]}."
     gpu_ordinal=$((gpu_ordinal + 1))
     kubectl label node "$worker_node" \
-      pactllm-role=gpu-backend \
-      pactllm-cluster-id="$CLUSTER_ID" \
-      pactllm-backend-index="$gpu_ordinal" \
-      pactllm-gpu-model=rtx3090 \
+      prrw-role=gpu-backend \
+      prrw-backend-index="$gpu_ordinal" \
+      prrw-gpu-model=rtx3090 \
       --overwrite
     kubectl label node "$worker_node" nvidia.com/gpu.deploy.operands- 2>/dev/null || true
   done
 
-  [[ "$(kubectl get nodes -l pactllm-role=platform --no-headers | wc -l | tr -d '[:space:]')" == '1' ]] || die 'Expected exactly one platform node.'
-  [[ "$(kubectl get nodes -l pactllm-role=gpu-backend --no-headers | wc -l | tr -d '[:space:]')" == "$GPU_WORKER_COUNT" ]] || die 'GPU backend node labeling failed.'
-  [[ "$(kubectl get nodes -l "pactllm-cluster-id=${CLUSTER_ID}" --no-headers | wc -l | tr -d '[:space:]')" == "$((GPU_WORKER_COUNT + 1))" ]] || \
-    die 'Cluster identity labeling failed.'
+  [[ "$(kubectl get nodes -l prrw-role=platform --no-headers | wc -l | tr -d '[:space:]')" == '1' ]] || die 'Expected exactly one platform node.'
+  [[ "$(kubectl get nodes -l prrw-role=gpu-backend --no-headers | wc -l | tr -d '[:space:]')" == "$GPU_WORKER_COUNT" ]] || die 'GPU backend node labeling failed.'
   printstyle 'Node roles and stable experiment indices applied: 1 platform and GPU backends 1-4.\n\n' success
 }
 
@@ -969,7 +799,7 @@ reclaimPolicy: Retain
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: pactllm-dynamo-nats
+  name: prrw-dynamo-nats
 spec:
   capacity:
     storage: ${DYNAMO_NATS_STORAGE_SIZE}
@@ -1039,7 +869,7 @@ verify_gpu_resources() {
   local inventory line node_name role gpu_count gpu_nodes=0 total_gpus=0
   local expected_total=$((GPU_WORKER_COUNT * NVIDIA_GPU_COUNT_PER_WORKER))
 
-  inventory="$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"="}{.metadata.labels.pactllm-role}{"="}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}')" || \
+  inventory="$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"="}{.metadata.labels.prrw-role}{"="}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}')" || \
     die 'Failed to read allocatable NVIDIA GPU resources.'
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
@@ -1056,7 +886,7 @@ verify_gpu_resources() {
     elif [[ "$role" == 'platform' ]]; then
       [[ -z "$gpu_count" || "$gpu_count" == '0' ]] || die "Platform node $node_name unexpectedly exposes $gpu_count NVIDIA GPUs."
     else
-      die "Node $node_name has an unexpected or missing pactllm-role label: ${role:-missing}"
+      die "Node $node_name has an unexpected or missing prrw-role label: ${role:-missing}"
     fi
   done <<< "$inventory"
 
@@ -1260,8 +1090,207 @@ worker_node_is_ready() {
   fi
 }
 
+unmount_partial_kubernetes_mounts() {
+  local node_kind="$1"
+  local target mount_inventory include_etcd='false'
+  local -a targets=()
+
+  [[ "$node_kind" == 'control-plane' ]] && include_etcd='true'
+  mount_inventory="$(findmnt -rn -o TARGET)" || {
+    printf 'Cannot inspect partial Kubernetes/CNI mounts.\n' >&2
+    return 1
+  }
+  mapfile -t targets < <(
+    awk -v include_etcd="$include_etcd" '$0 == "/etc/kubernetes" || index($0, "/etc/kubernetes/") == 1 ||
+           $0 == "/var/lib/kubelet" || index($0, "/var/lib/kubelet/") == 1 ||
+           $0 == "/etc/cni/net.d" || index($0, "/etc/cni/net.d/") == 1 ||
+           $0 == "/var/lib/cni" || index($0, "/var/lib/cni/") == 1 ||
+           $0 == "/var/lib/calico" || index($0, "/var/lib/calico/") == 1 ||
+           $0 == "/run/calico" || index($0, "/run/calico/") == 1 ||
+           $0 == "/var/run/calico" || index($0, "/var/run/calico/") == 1 ||
+           $0 == "/run/kubernetes" || index($0, "/run/kubernetes/") == 1 ||
+           $0 == "/var/run/kubernetes" || index($0, "/var/run/kubernetes/") == 1 ||
+           (include_etcd == "true" && ($0 == "/var/lib/etcd" || index($0, "/var/lib/etcd/") == 1)) ||
+           $0 ~ /^\/run\/netns\/cni-/ {
+             print length($0), $0
+           }' <<< "$mount_inventory" | sort -rn | cut -d' ' -f2-
+  )
+  for target in "${targets[@]}"; do
+    [[ -n "$target" ]] || continue
+    if ! umount -- "$target" 2>/dev/null; then
+      umount --lazy -- "$target" 2>/dev/null || {
+        printf 'Failed to detach partial Kubernetes/CNI mount: %s\n' "$target" >&2
+        return 1
+      }
+    fi
+  done
+
+  mount_inventory="$(findmnt -rn -o TARGET)" || {
+    printf 'Cannot verify partial Kubernetes/CNI mount removal.\n' >&2
+    return 1
+  }
+  if awk -v include_etcd="$include_etcd" '$0 == "/etc/kubernetes" || index($0, "/etc/kubernetes/") == 1 ||
+      $0 == "/var/lib/kubelet" || index($0, "/var/lib/kubelet/") == 1 ||
+      $0 == "/etc/cni/net.d" || index($0, "/etc/cni/net.d/") == 1 ||
+      $0 == "/var/lib/cni" || index($0, "/var/lib/cni/") == 1 ||
+      $0 == "/var/lib/calico" || index($0, "/var/lib/calico/") == 1 ||
+      $0 == "/run/calico" || index($0, "/run/calico/") == 1 ||
+      $0 == "/var/run/calico" || index($0, "/var/run/calico/") == 1 ||
+      $0 == "/run/kubernetes" || index($0, "/run/kubernetes/") == 1 ||
+      $0 == "/var/run/kubernetes" || index($0, "/var/run/kubernetes/") == 1 ||
+      (include_etcd == "true" && ($0 == "/var/lib/etcd" || index($0, "/var/lib/etcd/") == 1)) ||
+      $0 ~ /^\/run\/netns\/cni-/ { found = 1 } END { exit !found }' <<< "$mount_inventory"; then
+    printf 'A partial Kubernetes/CNI mount remains active.\n' >&2
+    return 1
+  fi
+  if [[ -d /run/netns ]]; then
+    find /run/netns -maxdepth 1 \( -type f -o -type l \) -name 'cni-*' -delete || return 1
+  fi
+}
+
+clear_partial_cni_interfaces() {
+  local iface link_inventory
+
+  # Linux can recreate an empty fallback IPIP device. Remove Calico state from
+  # tunl0, but accept the device itself when it comes back without state.
+  if ip link show tunl0 >/dev/null 2>&1; then
+    ip -4 route flush dev tunl0 2>/dev/null || true
+    ip -6 route flush dev tunl0 2>/dev/null || true
+    ip -4 addr flush dev tunl0 2>/dev/null || true
+    ip -6 addr flush dev tunl0 2>/dev/null || true
+    ip link set tunl0 down 2>/dev/null || true
+    ip link delete tunl0 2>/dev/null || true
+  fi
+  for iface in cni0 flannel.1 vxlan.calico vxlan-v6.calico wireguard.cali wg-v6.cali; do
+    ip link delete "$iface" 2>/dev/null || true
+  done
+  link_inventory="$(ip -o link show)" || {
+    printf 'Cannot inspect partial Calico/CNI interfaces.\n' >&2
+    return 1
+  }
+  while IFS= read -r iface; do
+    [[ -n "$iface" ]] || continue
+    ip link delete "$iface" 2>/dev/null || true
+  done < <(awk -F': ' '$2 ~ /^cali/ { split($2, a, "@"); print a[1] }' <<< "$link_inventory")
+
+  link_inventory="$(ip -o link show)" || {
+    printf 'Cannot verify partial Calico/CNI interface removal.\n' >&2
+    return 1
+  }
+  if awk -F': ' '{print $2}' <<< "$link_inventory" | \
+      grep -Eq '^(cali|cni0($|@)|flannel\.1($|@)|vxlan(-v6)?\.calico($|@)|wireguard\.cali($|@)|wg-v6\.cali($|@))'; then
+    printf 'A partial Calico/CNI interface remains after reset.\n' >&2
+    return 1
+  fi
+  if ip link show tunl0 >/dev/null 2>&1 && {
+       ip -o addr show dev tunl0 2>/dev/null | grep -q . ||
+       ip -4 route show dev tunl0 2>/dev/null | grep -q . ||
+       ip -6 route show dev tunl0 2>/dev/null | grep -q .;
+     }; then
+    printf 'The fallback tunl0 interface still carries address or route state.\n' >&2
+    return 1
+  fi
+}
+
+reset_partial_kubernetes_node() {
+  local node_kind="$1"
+  local required_command
+
+  [[ "$node_kind" == 'control-plane' || "$node_kind" == 'gpu-backend-worker' ]] || {
+    printf 'Invalid partial reset node kind: %s\n' "$node_kind" >&2
+    return 1
+  }
+  for required_command in findmnt umount ip awk sort cut grep find rm systemctl timeout; do
+    command -v "$required_command" >/dev/null 2>&1 || {
+      printf 'Required partial reset command is unavailable: %s\n' "$required_command" >&2
+      return 1
+    }
+  done
+  systemctl stop kubelet >/dev/null 2>&1 || true
+  if command -v kubeadm >/dev/null 2>&1; then
+    timeout 180s kubeadm reset -f --cleanup-tmp-dir --cri-socket "$CRI_SOCKET" || \
+      printf 'kubeadm reset did not complete; continuing with bounded explicit state removal.\n' >&2
+  fi
+  if command -v crictl >/dev/null 2>&1 && systemctl is-active --quiet containerd; then
+    crictl --runtime-endpoint "$CRI_SOCKET" rm -fa >/dev/null 2>&1 || true
+    crictl --runtime-endpoint "$CRI_SOCKET" rmp -fa >/dev/null 2>&1 || true
+  fi
+  systemctl stop kubelet >/dev/null 2>&1 || true
+  systemctl stop containerd >/dev/null 2>&1 || true
+  unmount_partial_kubernetes_mounts "$node_kind" || return 1
+  clear_partial_cni_interfaces || return 1
+  rm -rf -- \
+    /etc/kubernetes \
+    /var/lib/kubelet \
+    /etc/cni/net.d \
+    /var/lib/cni \
+    /var/lib/calico \
+    /run/calico \
+    /var/run/calico \
+    /run/kubernetes \
+    /var/run/kubernetes || {
+      printf 'Failed to remove bounded partial Kubernetes/CNI state.\n' >&2
+      return 1
+    }
+  if [[ "$node_kind" == 'control-plane' ]]; then
+    rm -rf -- /var/lib/etcd || {
+      printf 'Failed to remove partial control-plane etcd state.\n' >&2
+      return 1
+    }
+  fi
+}
+
+build_partial_node_reset_command() {
+  local node_kind="$1"
+
+  declare -f unmount_partial_kubernetes_mounts
+  declare -f clear_partial_cni_interfaces
+  declare -f reset_partial_kubernetes_node
+  printf 'CRI_SOCKET=%q\n' "$CRI_SOCKET"
+  printf 'set -o pipefail\n'
+  printf 'reset_partial_kubernetes_node %q\n' "$node_kind"
+}
+
+verify_resumable_control_plane() {
+  local control_plane_node server_version kubelet_version runtime_version resource
+  local -a required_resources=(
+    configmap/kubeadm-config
+    deployment/coredns
+    service/kube-dns
+    daemonset/kube-proxy
+  )
+
+  control_plane_node="$(node_name_for_ip "$CONTROL_PLANE_IP")" || \
+    die "Resume refused: exactly one Kubernetes Node must own configured CONTROL_PLANE_IP $CONTROL_PLANE_IP."
+  [[ "$control_plane_node" == "$LOCAL_HOSTNAME" ]] || \
+    die "Resume refused: CONTROL_PLANE_IP $CONTROL_PLANE_IP belongs to Node $control_plane_node, not local host $LOCAL_HOSTNAME."
+  kubectl get nodes -l node-role.kubernetes.io/control-plane -o name | \
+    grep -Fxq "node/${control_plane_node}" || \
+    die "Resume refused: Node $control_plane_node does not carry the kubeadm control-plane label."
+
+  server_version="$(kubectl get --raw='/version' | \
+    sed -n 's/.*"gitVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')" || \
+    die 'Resume refused: cannot read the Kubernetes API server version.'
+  kubelet_version="$(kubectl get node "$control_plane_node" -o jsonpath='{.status.nodeInfo.kubeletVersion}')" || \
+    die "Resume refused: cannot read kubelet version from $control_plane_node."
+  runtime_version="$(kubectl get node "$control_plane_node" -o jsonpath='{.status.nodeInfo.containerRuntimeVersion}')" || \
+    die "Resume refused: cannot read container runtime version from $control_plane_node."
+  [[ "$server_version" == "v${KUBERNETES_VERSION}" ]] || \
+    die "Resume refused: API server is ${server_version:-unknown}, expected v${KUBERNETES_VERSION}. Run cleanup and perform a fresh bootstrap."
+  [[ "$kubelet_version" == "v${KUBERNETES_VERSION}" ]] || \
+    die "Resume refused: control-plane kubelet is ${kubelet_version:-unknown}, expected v${KUBERNETES_VERSION}. Run cleanup and perform a fresh bootstrap."
+  [[ "$runtime_version" == "containerd://${CONTAINERD_VERSION}" ]] || \
+    die "Resume refused: control-plane runtime is ${runtime_version:-unknown}, expected containerd://${CONTAINERD_VERSION}. Run cleanup and perform a fresh bootstrap."
+
+  for resource in "${required_resources[@]}"; do
+    kubectl -n kube-system get "$resource" >/dev/null 2>&1 || \
+      die "Resume refused: mandatory kubeadm resource kube-system/$resource is missing. The control plane is incomplete; run cleanup and perform a fresh bootstrap."
+  done
+  printstyle "Existing control plane matches configured host and pinned Kubernetes/runtime versions.\n" success
+}
+
 reconcile_workers() {
-  local join_command index node_name deadline
+  local join_command index node_name deadline reset_command
   local -a missing_indices=()
 
   for index in "${!WORKER_IPS[@]}"; do
@@ -1292,49 +1321,28 @@ reconcile_workers() {
     if node_name="$(node_name_for_ip "${WORKER_IPS[$index]}" 2>/dev/null)"; then
       kubectl delete node "$node_name" --wait=true --timeout=120s || die "Failed to remove stale Node object $node_name."
     fi
-    remote_privileged_command "$index" \
-      "if command -v kubeadm >/dev/null 2>&1; then kubeadm reset -f --cleanup-tmp-dir --cri-socket '${CRI_SOCKET}' || exit 1; fi; systemctl stop kubelet >/dev/null 2>&1 || true; for iface in cni0 tunl0 vxlan.calico vxlan-v6.calico wireguard.cali wg-v6.cali; do ip link delete \"\$iface\" 2>/dev/null || true; done; ip -o link show | awk -F': ' '\$2 ~ /^cali/ { split(\$2, a, \"@\"); print a[1] }' | while read -r iface; do ip link delete \"\$iface\" 2>/dev/null || true; done; rm -rf /etc/kubernetes /etc/cni/net.d /var/lib/cni /var/lib/calico /var/run/calico" || \
-      die "Failed to reset the marked partial worker ${WORKER_IPS[$index]}."
+    reset_command="$(build_partial_node_reset_command gpu-backend-worker)"
+    remote_privileged_command "$index" "$reset_command" || \
+      die "Failed to reset the partial worker ${WORKER_IPS[$index]}."
     install_remote_worker "$index" "$join_command"
   done
 }
 
 resume_cluster_bootstrap() {
-  local deadline control_plane_state
+  local deadline had_admin_conf='false'
 
   lineprint
-  printstyle 'Reconciling and resuming the existing marked research cluster ...\n' info
+  printstyle 'Reconciling and resuming the configured research cluster ...\n' info
 
   verify_local_host_preflight false
   install_orchestration_dependencies
   prepare_ssh_state
   preflight_remote_access false
-  control_plane_state="$(control_plane_initialized_state)"
-  if [[ -z "$control_plane_state" ]]; then
-    if [[ -f /etc/kubernetes/admin.conf ]] && command -v kubectl >/dev/null 2>&1 && \
-       KUBECONFIG=/etc/kubernetes/admin.conf kubectl get --raw='/readyz' --request-timeout=10s 2>/dev/null | grep -Fxq ok && \
-       cluster_identity_configmap_matches; then
-      printstyle 'Migrating a healthy legacy marker to the explicit control-plane phase format.\n' warning
-      set_control_plane_initialized
-      control_plane_state='true'
-    else
-      die 'The marker has no control-plane phase and the API is unavailable. Refusing an unsafe automatic reset; use the matching cleanup first.'
-    fi
-  fi
-  [[ "$control_plane_state" == 'true' || "$control_plane_state" == 'false' ]] || \
-    die "Invalid CONTROL_PLANE_INITIALIZED state in $NODE_MARKER_FILE."
-  if [[ "$control_plane_state" == 'true' && -f /etc/kubernetes/admin.conf ]] && \
-     KUBECONFIG=/etc/kubernetes/admin.conf kubectl get --raw='/readyz' --request-timeout=10s 2>/dev/null | grep -Fxq ok; then
-    cluster_identity_configmap_matches || \
-      die 'The live Kubernetes API does not carry the cluster identity from cluster.env. Refusing to touch an unrelated cluster.'
-  fi
-  if [[ "$control_plane_state" == 'false' ]]; then
-    printstyle 'The marked control plane stopped before kubeadm init completed; rebuilding its local foundation.\n' warning
-    if command -v kubeadm >/dev/null 2>&1; then
-      kubeadm reset -f --cleanup-tmp-dir --cri-socket "$CRI_SOCKET" || die 'Cannot reset the partial marked control plane.'
-    fi
-    systemctl stop kubelet >/dev/null 2>&1 || true
-    rm -rf /etc/kubernetes /etc/cni/net.d /var/lib/etcd
+  if [[ -f /etc/kubernetes/admin.conf ]]; then
+    had_admin_conf='true'
+  else
+    printstyle 'No initialized control plane was found; rebuilding the configured local foundation.\n' warning
+    reset_partial_kubernetes_node control-plane || die 'Cannot safely clear the partial control-plane state.'
     rm -f /root/.kube/config
     if [[ -n "$REGULAR_USER_HOME" ]]; then
       rm -f -- "$REGULAR_USER_HOME/.kube/config"
@@ -1348,11 +1356,16 @@ resume_cluster_bootstrap() {
   systemctl restart kubelet >/dev/null 2>&1 || true
   deadline=$((SECONDS + 120))
   until kubectl get --raw='/readyz' --request-timeout=10s 2>/dev/null | grep -Fxq ok; do
-    (( SECONDS < deadline )) || die 'Cannot resume: the Kubernetes API did not become ready within 120 seconds.'
+    if (( SECONDS >= deadline )); then
+      if [[ "$had_admin_conf" == 'true' ]]; then
+        die 'Existing admin.conf was found, but the Kubernetes API did not recover within 120 seconds. No automatic control-plane reset was attempted; run cleanup and perform a fresh bootstrap.'
+      fi
+      die 'The rebuilt Kubernetes API did not become ready within 120 seconds; run cleanup and perform a fresh bootstrap.'
+    fi
     sleep 5
   done
-  cluster_identity_configmap_matches || \
-    die 'The live Kubernetes API does not carry the cluster identity from cluster.env. Refusing to mutate an unrelated cluster.'
+  verify_resumable_control_plane
+  configure_kubeconfig
   pin_core_cluster_services
   install_calico
   install_metrics_server
@@ -1398,8 +1411,8 @@ cleanup_gpu_smoke_pods() {
   local selector remaining
 
   for selector in \
-    'app.kubernetes.io/name=pactllm-gpu-smoke' \
-    'app.kubernetes.io/name=pactllm-gpu-runtimeclass-smoke'; do
+    'app.kubernetes.io/name=prrw-gpu-smoke' \
+    'app.kubernetes.io/name=prrw-gpu-runtimeclass-smoke'; do
     kubectl -n kube-system delete pod \
       -l "$selector" \
       --ignore-not-found \
@@ -1424,7 +1437,7 @@ verify_gpu_runtime_smoke() {
   for index in "${GPU_WORKER_INDICES[@]}"; do
     ordinal=$((ordinal + 1))
     node_name="$(node_name_for_ip "${WORKER_IPS[$index]}")" || die "Cannot resolve GPU backend ${WORKER_IPS[$index]} for the smoke test."
-    pod_name="pactllm-gpu-smoke-${ordinal}"
+    pod_name="prrw-gpu-smoke-${ordinal}"
     kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -1432,7 +1445,7 @@ metadata:
   name: ${pod_name}
   namespace: kube-system
   labels:
-    app.kubernetes.io/name: pactllm-gpu-smoke
+    app.kubernetes.io/name: prrw-gpu-smoke
 spec:
   restartPolicy: Never
   nodeName: ${node_name}
@@ -1456,9 +1469,9 @@ EOF
 
   deadline=$((SECONDS + 900))
   while (( SECONDS < deadline )); do
-    phases="$(kubectl -n kube-system get pods -l app.kubernetes.io/name=pactllm-gpu-smoke -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}')"
+    phases="$(kubectl -n kube-system get pods -l app.kubernetes.io/name=prrw-gpu-smoke -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}')"
     if grep -Fxq Failed <<< "$phases"; then
-      kubectl -n kube-system describe pods -l app.kubernetes.io/name=pactllm-gpu-smoke || true
+      kubectl -n kube-system describe pods -l app.kubernetes.io/name=prrw-gpu-smoke || true
       cleanup_gpu_smoke_pods
       die 'At least one native-CDI GPU/vLLM smoke pod failed.'
     fi
@@ -1469,7 +1482,7 @@ EOF
     sleep 5
   done
   [[ "${succeeded:-0}" == "$GPU_WORKER_COUNT" ]] || {
-    kubectl -n kube-system describe pods -l app.kubernetes.io/name=pactllm-gpu-smoke || true
+    kubectl -n kube-system describe pods -l app.kubernetes.io/name=prrw-gpu-smoke || true
     cleanup_gpu_smoke_pods
     die 'Native-CDI GPU/vLLM smoke pods did not complete before the timeout.'
   }
@@ -1513,13 +1526,13 @@ EOF
       die "GPU workers resolved ${DYNAMO_VLLM_IMAGE} to different image digests."
     fi
     DYNAMO_VLLM_IMAGE_IDS+="${pod_name}=${image_id};"
-  done < <(kubectl -n kube-system get pods -l app.kubernetes.io/name=pactllm-gpu-smoke -o name)
+  done < <(kubectl -n kube-system get pods -l app.kubernetes.io/name=prrw-gpu-smoke -o name)
 
   ordinal=0
   for index in "${GPU_WORKER_INDICES[@]}"; do
     ordinal=$((ordinal + 1))
     node_name="$(node_name_for_ip "${WORKER_IPS[$index]}")" || die "Cannot resolve GPU backend ${WORKER_IPS[$index]} for the RuntimeClass smoke test."
-    pod_name="pactllm-gpu-runtimeclass-smoke-${ordinal}"
+    pod_name="prrw-gpu-runtimeclass-smoke-${ordinal}"
     kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -1527,7 +1540,7 @@ metadata:
   name: ${pod_name}
   namespace: kube-system
   labels:
-    app.kubernetes.io/name: pactllm-gpu-runtimeclass-smoke
+    app.kubernetes.io/name: prrw-gpu-runtimeclass-smoke
 spec:
   restartPolicy: Never
   runtimeClassName: nvidia
@@ -1544,8 +1557,8 @@ spec:
 EOF
   done
   if ! kubectl -n kube-system wait --for=jsonpath='{.status.phase}'=Succeeded pod \
-    -l app.kubernetes.io/name=pactllm-gpu-runtimeclass-smoke --timeout=600s; then
-    kubectl -n kube-system describe pods -l app.kubernetes.io/name=pactllm-gpu-runtimeclass-smoke || true
+    -l app.kubernetes.io/name=prrw-gpu-runtimeclass-smoke --timeout=600s; then
+    kubectl -n kube-system describe pods -l app.kubernetes.io/name=prrw-gpu-runtimeclass-smoke || true
     cleanup_gpu_smoke_pods
     die 'At least one explicit nvidia RuntimeClass smoke pod failed.'
   fi
@@ -1555,7 +1568,7 @@ EOF
       cleanup_gpu_smoke_pods
       die "The explicit nvidia RuntimeClass did not expose the exact expected GPU in $pod_name."
     }
-  done < <(kubectl -n kube-system get pods -l app.kubernetes.io/name=pactllm-gpu-runtimeclass-smoke -o name)
+  done < <(kubectl -n kube-system get pods -l app.kubernetes.io/name=prrw-gpu-runtimeclass-smoke -o name)
 
   cleanup_gpu_smoke_pods
   printstyle "Native CDI and RuntimeClass nvidia succeeded on all ${GPU_WORKER_COUNT} GPU backends; vLLM ${DYNAMO_VLLM_VERSION} and CUDA 13.0 were verified.\n\n" success
@@ -1568,9 +1581,8 @@ write_environment_report() {
   temp_file="$(mktemp)"
   LOCAL_TEMP_PATHS+=("$temp_file")
   {
-    printf 'PactLLM research cluster bootstrap report\n'
+    printf 'PRRW research cluster bootstrap report\n'
     printf 'generated_at=%s\n' "$(date --iso-8601=seconds)"
-    printf 'cluster_id=%s\n' "$CLUSTER_ID"
     printf 'control_plane_ip=%s\n' "$CONTROL_PLANE_IP"
     printf 'clock_policy=all nodes NTP synchronized, maximum observed preflight skew <= %ss\n' "$MAX_CLOCK_SKEW_SECONDS"
     printf 'topology=1 platform + %s gpu-backend\n' "$GPU_WORKER_COUNT"
@@ -1581,16 +1593,16 @@ write_environment_report() {
     printf 'validated_cuda_runtime=13.0\n'
     printf 'gateway_api=%s\ngaie=%s\nagentgateway=%s\n' "$GATEWAY_API_VERSION" "$GAIE_VERSION" "$AGENTGATEWAY_VERSION"
     printf '\n[NODES]\n'
-    kubectl get nodes -L pactllm-role,pactllm-backend-index,pactllm-gpu-model -o wide
+    kubectl get nodes -L prrw-role,prrw-backend-index,prrw-gpu-model -o wide
     printf '\n[GPU ALLOCATABLE]\n'
-    kubectl get nodes -o custom-columns='NAME:.metadata.name,ROLE:.metadata.labels.pactllm-role,GPU:.status.allocatable.nvidia\.com/gpu'
+    kubectl get nodes -o custom-columns='NAME:.metadata.name,ROLE:.metadata.labels.prrw-role,GPU:.status.allocatable.nvidia\.com/gpu'
     printf '\n[RUNTIME CLASSES]\n'
     kubectl get runtimeclass
     printf '\n[HELM RELEASES]\n'
     helm list --all-namespaces
     printf '\n[PLATFORM STORAGE]\n'
     kubectl get storageclass "$DYNAMO_NATS_STORAGE_CLASS"
-    kubectl get pv pactllm-dynamo-nats
+    kubectl get pv prrw-dynamo-nats
     kubectl -n "$DYNAMO_NAMESPACE" get pvc
     printf '\n[PLATFORM PODS]\n'
     kubectl -n "$DYNAMO_NAMESPACE" get pods -o wide
@@ -1654,7 +1666,6 @@ install_remote_worker() {
 
   {
     printf 'NODE_ROLE=%s-worker\n' "$worker_role"
-    printf 'CLUSTER_ID=%s\n' "$CLUSTER_ID"
     printf 'KUBELET_NODE_IP=%s\n' "${WORKER_IPS[$index]}"
     printf 'KUBERNETES_VERSION=%s\n' "$KUBERNETES_VERSION"
     printf 'CONTAINERD_VERSION=%s\n' "$CONTAINERD_VERSION"
@@ -1709,12 +1720,9 @@ install_remote_worker() {
   printstyle "Worker $target joined successfully.\n\n" success
 }
 
-verify_worker_bootstrap_marker() {
-  local worker_role="${NODE_ROLE%-worker}"
-
+verify_worker_bootstrap_config() {
+  [[ "$NODE_ROLE" == 'gpu-backend-worker' ]] || die "Unexpected worker role: $NODE_ROLE"
   host_owns_ipv4 "$KUBELET_NODE_IP" || die "This worker does not own configured KUBELET_NODE_IP $KUBELET_NODE_IP."
-  validate_node_marker_file "$worker_role" "$KUBELET_NODE_IP" || \
-    die 'The root-owned worker marker does not match this cluster, role, IP, and Kubernetes version.'
 }
 
 join_worker_node() {
@@ -1769,7 +1777,6 @@ verify_cluster() {
 
   api_status="$(kubectl get --raw='/readyz')"
   [[ "$api_status" == 'ok' ]] || die "Kubernetes API readiness check failed: $api_status"
-  cluster_identity_configmap_matches || die 'Kubernetes API cluster identity changed during bootstrap.'
   kubectl -n kube-system rollout status deployment/coredns --timeout="$timeout"
 
   if [[ "$INSTALL_CALICO" == 'true' ]]; then
@@ -1807,14 +1814,36 @@ verify_cluster() {
 }
 
 verify_calico_node_ips() {
-  local node_name internal_ip calico_ip
+  local node_name internal_ip annotation_ip calico_ip lookup_source crd_output
 
   while IFS='=' read -r node_name internal_ip; do
     [[ -n "$node_name" && -n "$internal_ip" ]] || continue
-    calico_ip="$(kubectl get node.crd.projectcalico.org "$node_name" -o jsonpath='{.spec.bgp.ipv4Address}' 2>/dev/null || true)"
+    if ! annotation_ip="$(kubectl get node "$node_name" \
+      -o go-template='{{index .metadata.annotations "projectcalico.org/IPv4Address"}}' 2>&1)"; then
+      printstyle "Calico IPv4 annotation lookup failed for $node_name: $annotation_ip\n" warning
+      annotation_ip=''
+    fi
+    [[ "$annotation_ip" != '<no value>' ]] || annotation_ip=''
+    calico_ip="$annotation_ip"
+    lookup_source='Kubernetes Node annotation projectcalico.org/IPv4Address'
+    if [[ -z "$calico_ip" ]]; then
+      if crd_output="$(kubectl get node.crd.projectcalico.org "$node_name" \
+        -o jsonpath='{.spec.bgp.ipv4Address}' 2>&1)"; then
+        calico_ip="$crd_output"
+        lookup_source='Calico Node CRD spec.bgp.ipv4Address'
+      else
+        printstyle "Calico Node CRD fallback lookup failed for $node_name: $crd_output\n" warning
+      fi
+    fi
     calico_ip="${calico_ip%%/*}"
-    [[ "$calico_ip" == "$internal_ip" ]] || \
-      die "Calico selected ${calico_ip:-no IPv4 address} for $node_name, but Kubernetes InternalIP is $internal_ip."
+    if [[ "$calico_ip" != "$internal_ip" ]]; then
+      printstyle "Calico IP diagnostics for $node_name:\n" warning
+      kubectl get node "$node_name" \
+        -o custom-columns='NAME:.metadata.name,INTERNAL-IP:.status.addresses[?(@.type=="InternalIP")].address,CALICO-IP:.metadata.annotations.projectcalico\.org/IPv4Address' >&2 || true
+      kubectl -n kube-system get pods -l k8s-app=calico-node \
+        --field-selector "spec.nodeName=$node_name" -o wide >&2 || true
+      die "Calico selected ${calico_ip:-no IPv4 address} for $node_name via $lookup_source, but Kubernetes InternalIP is $internal_ip."
+    fi
   done < <(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"="}{range .status.addresses[?(@.type=="InternalIP")]}{.address}{end}{"\n"}{end}')
   printstyle 'Calico addresses match every Kubernetes InternalIP.\n' success
 }
@@ -1823,11 +1852,11 @@ cleanup_network_smoke_pods() {
   local remaining
 
   kubectl -n kube-system delete pod \
-    -l app.kubernetes.io/part-of=pactllm-network-smoke \
+    -l app.kubernetes.io/part-of=prrw-network-smoke \
     --ignore-not-found \
     --wait=true \
     --timeout=120s >/dev/null 2>&1 || die 'Failed to delete old network smoke pods.'
-  remaining="$(kubectl -n kube-system get pod -l app.kubernetes.io/part-of=pactllm-network-smoke --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')"
+  remaining="$(kubectl -n kube-system get pod -l app.kubernetes.io/part-of=prrw-network-smoke --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')"
   [[ "$remaining" == '0' ]] || die 'Old network smoke pods still exist.'
 }
 
@@ -1845,11 +1874,11 @@ verify_cross_node_network() {
 apiVersion: v1
 kind: Pod
 metadata:
-  name: pactllm-network-server-${ordinal}
+  name: prrw-network-server-${ordinal}
   namespace: kube-system
   labels:
-    app.kubernetes.io/name: pactllm-network-server
-    app.kubernetes.io/part-of: pactllm-network-smoke
+    app.kubernetes.io/name: prrw-network-server
+    app.kubernetes.io/part-of: prrw-network-smoke
 spec:
   restartPolicy: Never
   nodeName: ${node_name}
@@ -1862,12 +1891,12 @@ spec:
 EOF
   done
   if ! kubectl -n kube-system wait --for=condition=Ready pod \
-    -l app.kubernetes.io/name=pactllm-network-server --timeout=300s; then
-    kubectl -n kube-system describe pods -l app.kubernetes.io/part-of=pactllm-network-smoke || true
+    -l app.kubernetes.io/name=prrw-network-server --timeout=300s; then
+    kubectl -n kube-system describe pods -l app.kubernetes.io/part-of=prrw-network-smoke || true
     cleanup_network_smoke_pods
     die 'GPU-side TCP smoke servers did not become Ready.'
   fi
-  server_ips="$(kubectl -n kube-system get pods -l app.kubernetes.io/name=pactllm-network-server -o jsonpath='{range .items[*]}{.status.podIP}{" "}{end}')"
+  server_ips="$(kubectl -n kube-system get pods -l app.kubernetes.io/name=prrw-network-server -o jsonpath='{range .items[*]}{.status.podIP}{" "}{end}')"
   [[ "$(wc -w <<< "$server_ips" | tr -d '[:space:]')" == "$GPU_WORKER_COUNT" ]] || {
     cleanup_network_smoke_pods
     die 'Not every GPU-side network smoke pod received an IP.'
@@ -1878,11 +1907,11 @@ EOF
 apiVersion: v1
 kind: Pod
 metadata:
-  name: pactllm-network-client-platform
+  name: prrw-network-client-platform
   namespace: kube-system
   labels:
-    app.kubernetes.io/name: pactllm-network-client
-    app.kubernetes.io/part-of: pactllm-network-smoke
+    app.kubernetes.io/name: prrw-network-client
+    app.kubernetes.io/part-of: prrw-network-smoke
 spec:
   restartPolicy: Never
   nodeName: ${control_plane_node}
@@ -1903,7 +1932,7 @@ EOF
   for index in "${GPU_WORKER_INDICES[@]}"; do
     ordinal=$((ordinal + 1))
     node_name="$(node_name_for_ip "${WORKER_IPS[$index]}")" || die "Cannot resolve GPU backend ${WORKER_IPS[$index]} for network smoke testing."
-    pod_name="pactllm-network-client-gpu-${ordinal}"
+    pod_name="prrw-network-client-gpu-${ordinal}"
     kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -1911,8 +1940,8 @@ metadata:
   name: ${pod_name}
   namespace: kube-system
   labels:
-    app.kubernetes.io/name: pactllm-network-client
-    app.kubernetes.io/part-of: pactllm-network-smoke
+    app.kubernetes.io/name: prrw-network-client
+    app.kubernetes.io/part-of: prrw-network-smoke
 spec:
   restartPolicy: Never
   nodeName: ${node_name}
@@ -1927,12 +1956,12 @@ EOF
   done
 
   if ! kubectl -n kube-system wait --for=jsonpath='{.status.phase}'=Succeeded pod \
-    -l app.kubernetes.io/name=pactllm-network-client --timeout=300s; then
-    kubectl -n kube-system describe pods -l app.kubernetes.io/part-of=pactllm-network-smoke || true
+    -l app.kubernetes.io/name=prrw-network-client --timeout=300s; then
+    kubectl -n kube-system describe pods -l app.kubernetes.io/part-of=prrw-network-smoke || true
     cleanup_network_smoke_pods
     die 'A platform/GPU DNS/TCP network smoke client failed.'
   fi
-  client_count="$(kubectl -n kube-system get pods -l app.kubernetes.io/name=pactllm-network-client --no-headers | wc -l | tr -d '[:space:]')"
+  client_count="$(kubectl -n kube-system get pods -l app.kubernetes.io/name=prrw-network-client --no-headers | wc -l | tr -d '[:space:]')"
   [[ "$client_count" == "$((GPU_WORKER_COUNT + 1))" ]] || {
     cleanup_network_smoke_pods
     die "Expected $((GPU_WORKER_COUNT + 1)) network smoke clients, but found $client_count."
@@ -1944,7 +1973,7 @@ EOF
       cleanup_network_smoke_pods
       die "$pod_name did not reach all GPU-side Pod IPs."
     }
-  done < <(kubectl -n kube-system get pods -l app.kubernetes.io/name=pactllm-network-client -o name)
+  done < <(kubectl -n kube-system get pods -l app.kubernetes.io/name=prrw-network-client -o name)
 
   cleanup_network_smoke_pods
   printstyle "Cross-node DNS/TCP verification succeeded from the platform and all ${GPU_WORKER_COUNT} GPU backends to every GPU backend.\n\n" success
@@ -1959,7 +1988,7 @@ verify_selected_pods_on_platform() {
   while IFS='|' read -r pod_name node_name; do
     [[ -n "$pod_name" ]] || continue
     pod_count=$((pod_count + 1))
-    role="$(kubectl get node "$node_name" -o jsonpath='{.metadata.labels.pactllm-role}')"
+    role="$(kubectl get node "$node_name" -o jsonpath='{.metadata.labels.prrw-role}')"
     [[ "$role" == 'platform' ]] || die "$description pod $pod_name is on $node_name ($role), not the platform node."
   done < <(kubectl -n "$namespace" get pods -l "$selector" -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.nodeName}{"\n"}{end}')
   (( pod_count > 0 )) || die "No $description pods were found for placement verification."
@@ -2013,18 +2042,15 @@ CRI_SOCKET='unix:///run/containerd/containerd.sock'
 SANDBOX_IMAGE='registry.k8s.io/pause:3.10.1'
 NETWORK_SMOKE_IMAGE='docker.io/library/busybox:1.37.0'
 NVIDIA_SMI_GPU_NAME='NVIDIA GeForce RTX 3090'
-NODE_MARKER_DIR='/etc/pactllm-bootstrap'
-NODE_MARKER_FILE="${NODE_MARKER_DIR}/node.env"
-HELM_STATE_ROOT='/var/lib/pactllm-bootstrap/helm'
+HELM_STATE_ROOT='/var/lib/prrw-bootstrap/helm'
 HELM_CONFIG_HOME="${HELM_STATE_ROOT}/config"
 HELM_CACHE_HOME="${HELM_STATE_ROOT}/cache"
 HELM_DATA_HOME="${HELM_STATE_ROOT}/data"
 export HELM_CONFIG_HOME HELM_CACHE_HOME HELM_DATA_HOME
-SSH_STATE_DIR='/var/lib/pactllm-bootstrap/ssh'
+SSH_STATE_DIR='/var/lib/prrw-bootstrap/ssh'
 SSH_KNOWN_HOSTS_FILE="${SSH_STATE_DIR}/known_hosts"
 MAX_CLOCK_SKEW_SECONDS=5
 NODE_ROLE=''
-CLUSTER_ID=''
 KUBELET_NODE_IP=''
 KUBERNETES_VERSION=''
 CONTAINERD_VERSION=''
@@ -2051,9 +2077,9 @@ DYNAMO_VLLM_VERSION=''
 DYNAMO_VLLM_IMAGE=''
 DYNAMO_VLLM_IMAGE_IDS=''
 DYNAMO_NAMESPACE='dynamo-system'
-DYNAMO_NATS_STORAGE_CLASS='pactllm-local-nats'
+DYNAMO_NATS_STORAGE_CLASS='prrw-local-nats'
 DYNAMO_NATS_STORAGE_SIZE='10Gi'
-DYNAMO_NATS_STORAGE_PATH='/var/lib/pactllm/dynamo-nats'
+DYNAMO_NATS_STORAGE_PATH='/var/lib/prrw/dynamo-nats'
 PREPULL_DYNAMO_VLLM_IMAGE='true'
 INSTALL_GATEWAY_FOUNDATION='true'
 GATEWAY_API_VERSION=''
@@ -2075,12 +2101,10 @@ SCP_OPTIONS=(-o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" -o StrictHostKeyChe
 trap cleanup_local_temp_paths EXIT
 
 load_config
-ensure_cluster_id
 if [[ -z "$KUBELET_NODE_IP" ]]; then
   KUBELET_NODE_IP="$CONTROL_PLANE_IP"
 fi
 require_config_value NODE_ROLE
-require_config_value CLUSTER_ID
 require_config_value KUBERNETES_VERSION
 require_config_value CONTAINERD_VERSION
 require_config_value CALICO_VERSION
@@ -2133,7 +2157,7 @@ printstyle "GPU/AI versions: Toolkit v${NVIDIA_CONTAINER_TOOLKIT_VERSION}, GPU O
 
 case "$NODE_ROLE" in
   gpu-backend-worker)
-    verify_worker_bootstrap_marker
+    verify_worker_bootstrap_config
     install_node_components
     install_nvidia_container_toolkit
     join_worker_node
@@ -2151,7 +2175,6 @@ case "$NODE_ROLE" in
       install_orchestration_dependencies
       prepare_ssh_state
       preflight_remote_access
-      stage_node_markers
       install_node_components
       initialize_control_plane
       pin_core_cluster_services

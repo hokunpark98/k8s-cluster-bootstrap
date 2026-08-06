@@ -7,7 +7,7 @@ operator:
       requiredDuringSchedulingIgnoredDuringExecution:
         nodeSelectorTerms:
           - matchExpressions:
-              - key: pactllm-role
+              - key: prrw-role
                 operator: In
                 values:
                   - platform
@@ -51,14 +51,14 @@ ccManager:
 node-feature-discovery:
   master:
     nodeSelector:
-      pactllm-role: platform
+      prrw-role: platform
     tolerations:
       - key: node-role.kubernetes.io/control-plane
         operator: Exists
         effect: NoSchedule
   gc:
     nodeSelector:
-      pactllm-role: platform
+      prrw-role: platform
     tolerations:
       - key: node-role.kubernetes.io/control-plane
         operator: Exists

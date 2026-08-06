@@ -19,9 +19,9 @@ EXPECTED_DYNAMO_VERSION='1.3.0'
 EXPECTED_DYNAMO_VLLM_VERSION='0.23.0'
 EXPECTED_DYNAMO_VLLM_IMAGE='nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.3.0'
 EXPECTED_DYNAMO_NAMESPACE='dynamo-system'
-EXPECTED_DYNAMO_NATS_STORAGE_CLASS='pactllm-local-nats'
+FRESH_DYNAMO_NATS_STORAGE_CLASS='prrw-local-nats'
 EXPECTED_DYNAMO_NATS_STORAGE_SIZE='10Gi'
-EXPECTED_DYNAMO_NATS_STORAGE_PATH='/var/lib/pactllm/dynamo-nats'
+FRESH_DYNAMO_NATS_STORAGE_PATH='/var/lib/prrw/dynamo-nats'
 EXPECTED_GATEWAY_API_VERSION='1.5.1'
 EXPECTED_GAIE_VERSION='1.2.1'
 EXPECTED_AGENTGATEWAY_VERSION='1.0.0'
@@ -32,9 +32,10 @@ EXPECTED_REGULAR_USER_HOME='/home/dnclab'
 EXPECTED_WORKER_USER='dnclab'
 EXPECTED_GPU_WORKER_COUNT=4
 REMOTE_CLEANUP_DIR='/tmp/k8s-cluster-cleanup-1-35-6'
-NODE_MARKER_DIR='/etc/pactllm-bootstrap'
-NODE_MARKER_FILE="${NODE_MARKER_DIR}/node.env"
-BOOTSTRAP_STATE_ROOT='/var/lib/pactllm-bootstrap'
+BOOTSTRAP_STATE_ROOT='/var/lib/prrw-bootstrap'
+BOOTSTRAP_MARKER_SEARCH_ROOT='/etc'
+BOOTSTRAP_STATE_SEARCH_ROOT='/var/lib'
+BOOTSTRAP_MARKER_OWNER_UID=0
 HELM_STATE_ROOT="${BOOTSTRAP_STATE_ROOT}/helm"
 HELM_CONFIG_HOME="${HELM_STATE_ROOT}/config"
 HELM_CACHE_HOME="${HELM_STATE_ROOT}/cache"
@@ -90,8 +91,28 @@ valid_ipv4() {
   done
 }
 
-valid_cluster_id() {
-  [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+valid_kubernetes_dns_subdomain() {
+  local value="$1"
+  local label
+  local -a labels=()
+
+  (( ${#value} <= 253 )) || return 1
+  [[ "$value" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || return 1
+  [[ "$value" != *'..'* ]] || return 1
+  IFS='.' read -r -a labels <<< "$value"
+  for label in "${labels[@]}"; do
+    (( ${#label} <= 63 )) || return 1
+    [[ "$label" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || return 1
+  done
+}
+
+canonical_var_lib_child() {
+  local path="$1"
+  local canonical_path
+
+  [[ "$path" =~ ^/var/lib/[A-Za-z0-9._/-]+$ ]] || return 1
+  canonical_path="$(realpath -m -- "$path")" || return 1
+  [[ "$path" == "$canonical_path" && "$canonical_path" == /var/lib/?* ]]
 }
 
 require_config_value() {
@@ -126,7 +147,10 @@ load_config() {
     fi
 
     case "$key" in
-      NODE_ROLE|CLUSTER_ID|KUBERNETES_VERSION|CONTAINERD_VERSION|CALICO_VERSION|HELM_VERSION|CONTROL_PLANE_IP|POD_CIDR|INSTALL_CALICO|INSTALL_METRICS_SERVER|METRICS_SERVER_VERSION|REGULAR_USER_HOME|GPU_WORKER_COUNT|INSTALL_NVIDIA_STACK|NVIDIA_DRIVER_VERSION|NVIDIA_CONTAINER_TOOLKIT_VERSION|NVIDIA_GPU_MODEL|NVIDIA_GPU_MEMORY_MIB|NVIDIA_GPU_COUNT_PER_WORKER|GPU_OPERATOR_VERSION|INSTALL_DYNAMO_PLATFORM|DYNAMO_PLATFORM_VERSION|DYNAMO_VLLM_VERSION|DYNAMO_VLLM_IMAGE|DYNAMO_NAMESPACE|DYNAMO_NATS_STORAGE_CLASS|DYNAMO_NATS_STORAGE_SIZE|DYNAMO_NATS_STORAGE_PATH|PREPULL_DYNAMO_VLLM_IMAGE|INSTALL_GATEWAY_FOUNDATION|GATEWAY_API_VERSION|GAIE_VERSION|AGENTGATEWAY_VERSION|AGENTGATEWAY_NAMESPACE)
+      CLUSTER_ID)
+        warn 'Ignoring deprecated CLUSTER_ID from cluster.env; cleanup uses the configured node addresses.'
+        ;;
+      NODE_ROLE|KUBERNETES_VERSION|CONTAINERD_VERSION|CALICO_VERSION|HELM_VERSION|CONTROL_PLANE_IP|POD_CIDR|INSTALL_CALICO|INSTALL_METRICS_SERVER|METRICS_SERVER_VERSION|REGULAR_USER_HOME|GPU_WORKER_COUNT|INSTALL_NVIDIA_STACK|NVIDIA_DRIVER_VERSION|NVIDIA_CONTAINER_TOOLKIT_VERSION|NVIDIA_GPU_MODEL|NVIDIA_GPU_MEMORY_MIB|NVIDIA_GPU_COUNT_PER_WORKER|GPU_OPERATOR_VERSION|INSTALL_DYNAMO_PLATFORM|DYNAMO_PLATFORM_VERSION|DYNAMO_VLLM_VERSION|DYNAMO_VLLM_IMAGE|DYNAMO_NAMESPACE|DYNAMO_NATS_STORAGE_CLASS|DYNAMO_NATS_STORAGE_SIZE|DYNAMO_NATS_STORAGE_PATH|PREPULL_DYNAMO_VLLM_IMAGE|INSTALL_GATEWAY_FOUNDATION|GATEWAY_API_VERSION|GAIE_VERSION|AGENTGATEWAY_VERSION|AGENTGATEWAY_NAMESPACE)
         printf -v "$key" '%s' "$value"
         ;;
       *)
@@ -157,9 +181,9 @@ validate_fixed_stack() {
   [[ "$DYNAMO_VLLM_VERSION" == "$EXPECTED_DYNAMO_VLLM_VERSION" ]] || die "Cleanup only supports Dynamo vLLM $EXPECTED_DYNAMO_VLLM_VERSION."
   [[ "$DYNAMO_VLLM_IMAGE" == "$EXPECTED_DYNAMO_VLLM_IMAGE" ]] || die "Unexpected Dynamo vLLM image in cluster.env."
   [[ "$DYNAMO_NAMESPACE" == "$EXPECTED_DYNAMO_NAMESPACE" ]] || die "Cleanup only supports Dynamo namespace $EXPECTED_DYNAMO_NAMESPACE."
-  [[ "$DYNAMO_NATS_STORAGE_CLASS" == "$EXPECTED_DYNAMO_NATS_STORAGE_CLASS" ]] || die "Unexpected Dynamo NATS StorageClass."
+  valid_kubernetes_dns_subdomain "$DYNAMO_NATS_STORAGE_CLASS" || die 'DYNAMO_NATS_STORAGE_CLASS must be a safe Kubernetes DNS subdomain.'
   [[ "$DYNAMO_NATS_STORAGE_SIZE" == "$EXPECTED_DYNAMO_NATS_STORAGE_SIZE" ]] || die "Unexpected Dynamo NATS storage size."
-  [[ "$DYNAMO_NATS_STORAGE_PATH" == "$EXPECTED_DYNAMO_NATS_STORAGE_PATH" ]] || die "Unexpected Dynamo NATS storage path."
+  canonical_var_lib_child "$DYNAMO_NATS_STORAGE_PATH" || die 'DYNAMO_NATS_STORAGE_PATH must be a canonical strict child of /var/lib.'
   [[ "$GATEWAY_API_VERSION" == "$EXPECTED_GATEWAY_API_VERSION" ]] || die "Cleanup only supports Gateway API $EXPECTED_GATEWAY_API_VERSION."
   [[ "$GAIE_VERSION" == "$EXPECTED_GAIE_VERSION" ]] || die "Cleanup only supports GAIE $EXPECTED_GAIE_VERSION."
   [[ "$AGENTGATEWAY_VERSION" == "$EXPECTED_AGENTGATEWAY_VERSION" ]] || die "Cleanup only supports agentgateway $EXPECTED_AGENTGATEWAY_VERSION."
@@ -207,56 +231,6 @@ collect_workers() {
     WORKER_USERS+=("$user")
     WORKER_PASSWORDS+=("$password")
   done
-}
-
-validate_node_marker_file() {
-  local expected_cluster_id="$1"
-  local expected_role="$2"
-  local expected_ip="$3"
-
-  valid_cluster_id "$expected_cluster_id" || return 1
-  [[ -f "$NODE_MARKER_FILE" && ! -L "$NODE_MARKER_FILE" ]] || return 1
-  [[ "$(stat -c '%u:%g:%a' "$NODE_MARKER_FILE")" == '0:0:600' ]] || return 1
-  grep -Fxq "CLUSTER_ID=${expected_cluster_id}" "$NODE_MARKER_FILE" &&
-    grep -Fxq "NODE_ROLE=${expected_role}" "$NODE_MARKER_FILE" &&
-    grep -Fxq "NODE_IP=${expected_ip}" "$NODE_MARKER_FILE" &&
-    grep -Fxq "KUBERNETES_VERSION=${EXPECTED_KUBERNETES_VERSION}" "$NODE_MARKER_FILE" &&
-    grep -Eq '^CLEANUP_STATE=(active|cleaned)$' "$NODE_MARKER_FILE"
-}
-
-node_cleanup_state() {
-  awk -F= '$1 == "CLEANUP_STATE" { print $2; exit }' "$NODE_MARKER_FILE"
-}
-
-set_node_cleanup_state_cleaned() {
-  local temp_file
-
-  temp_file="$(mktemp)"
-  awk '
-    $0 ~ /^CLEANUP_STATE=/ {
-      if (!done) print "CLEANUP_STATE=cleaned"
-      done = 1
-      next
-    }
-    { print }
-    END { if (!done) print "CLEANUP_STATE=cleaned" }
-  ' "$NODE_MARKER_FILE" > "$temp_file"
-  install -o root -g root -m 0600 "$temp_file" "$NODE_MARKER_FILE"
-  rm -f -- "$temp_file"
-}
-
-verify_remote_marker() {
-  local index="$1"
-  local ip command
-
-  ip="${WORKER_IPS[$index]}"
-  command="test -f '${NODE_MARKER_FILE}' && test ! -L '${NODE_MARKER_FILE}' && test \"\$(stat -c '%u:%g:%a' '${NODE_MARKER_FILE}')\" = '0:0:600' && grep -Fxq 'CLUSTER_ID=${CLUSTER_ID}' '${NODE_MARKER_FILE}' && grep -Fxq 'NODE_ROLE=gpu-backend' '${NODE_MARKER_FILE}' && grep -Fxq 'NODE_IP=${ip}' '${NODE_MARKER_FILE}' && grep -Fxq 'KUBERNETES_VERSION=${EXPECTED_KUBERNETES_VERSION}' '${NODE_MARKER_FILE}' && grep -Eq '^CLEANUP_STATE=(active|cleaned)$' '${NODE_MARKER_FILE}'"
-  remote_privileged_command "$index" "$command"
-}
-
-remote_marker_cleanup_state() {
-  local index="$1"
-  remote_privileged_command "$index" "awk -F= '\$1 == \"CLEANUP_STATE\" { print \$2; exit }' '${NODE_MARKER_FILE}'"
 }
 
 prepare_ssh_state() {
@@ -319,7 +293,7 @@ preflight_remote_workers() {
     target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
     password="${WORKER_PASSWORDS[$index]}"
     user="${WORKER_USERS[$index]}"
-    printstyle "Checking SSH, sudo, target IP, and role prerequisites on $target ...\n" info
+    printstyle "Checking SSH, sudo, target IP, and GPU prerequisites on $target ...\n" info
 
     SSHPASS="$password" sshpass -e ssh "${SSH_OPTIONS[@]}" "$target" 'true' || \
       die "Cannot connect to $target. Cleanup has not started."
@@ -335,81 +309,7 @@ preflight_remote_workers() {
       die "Remote host $target has an invalid Kubernetes node hostname: $hostname_short"
     [[ -z "${seen_hostnames[$hostname_short]:-}" ]] || die "Duplicate node hostname detected: $hostname_short"
     seen_hostnames["$hostname_short"]=1
-    WORKER_HOSTNAMES[$index]="$hostname_short"
-    verify_remote_marker "$index" || \
-      die "Remote host $target does not have the matching root-owned cluster/role/IP marker. Cleanup has not started."
-    WORKER_CLEANUP_STATES[$index]="$(remote_marker_cleanup_state "$index")"
-    [[ "${WORKER_CLEANUP_STATES[$index]}" == 'active' || "${WORKER_CLEANUP_STATES[$index]}" == 'cleaned' ]] || \
-      die "Remote host $target has an invalid cleanup marker state."
     verify_remote_driver "$index"
-  done
-}
-
-verify_api_inventory_if_available() {
-  local node node_name addresses matched_ip candidate_ip match_count role api_cluster_id index expected_name identity control_plane_phase
-  declare -A expected_roles=()
-  declare -A expected_names=()
-  declare -A seen_ips=()
-
-  if ! cluster_api_available; then
-    warn 'Kubernetes API is unavailable; cleanup identity is guarded by the root-owned node markers only.'
-    return 0
-  fi
-  if KUBECONFIG=/etc/kubernetes/admin.conf kubectl -n kube-system get configmap pactllm-cluster-identity >/dev/null 2>&1; then
-    identity="$(KUBECONFIG=/etc/kubernetes/admin.conf kubectl -n kube-system get configmap pactllm-cluster-identity \
-      -o jsonpath='{.data.cluster_id}{"|"}{.data.control_plane_ip}{"|"}{.data.kubernetes_version}')"
-    [[ "$identity" == "${CLUSTER_ID}|${CONTROL_PLANE_IP}|${KUBERNETES_VERSION}" ]] || \
-      die 'The live Kubernetes API carries a different PactLLM cluster identity. Cleanup refused.'
-  else
-    control_plane_phase="$(awk -F= '$1 == "CONTROL_PLANE_INITIALIZED" { print $2; exit }' "$NODE_MARKER_FILE")"
-    [[ "$control_plane_phase" != 'true' ]] || \
-      die 'The marker says control-plane initialization completed, but the API identity ConfigMap is missing. Cleanup refused.'
-    warn 'The API identity ConfigMap is absent; continuing only because the marker identifies an incomplete control-plane initialization.'
-  fi
-  expected_roles["$CONTROL_PLANE_IP"]='platform'
-  expected_names["$CONTROL_PLANE_IP"]="$LOCAL_HOSTNAME"
-  for index in "${!WORKER_IPS[@]}"; do
-    expected_roles["${WORKER_IPS[$index]}"]='gpu-backend'
-    expected_names["${WORKER_IPS[$index]}"]="${WORKER_HOSTNAMES[$index]}"
-  done
-
-  while IFS= read -r node; do
-    [[ -n "$node" ]] || continue
-    node_name="${node#node/}"
-    addresses="$(KUBECONFIG=/etc/kubernetes/admin.conf kubectl get "$node" -o jsonpath='{range .status.addresses[?(@.type=="InternalIP")]}{.address}{"\n"}{end}')"
-    matched_ip=''
-    match_count=0
-    for candidate_ip in "${!expected_roles[@]}"; do
-      if grep -Fxq "$candidate_ip" <<< "$addresses"; then
-        matched_ip="$candidate_ip"
-        match_count=$((match_count + 1))
-      fi
-    done
-    (( match_count > 0 )) || die "Unexpected Kubernetes Node $node_name has no configured cluster InternalIP. Cleanup refused."
-    (( match_count == 1 )) || die "Kubernetes Node $node_name owns more than one configured cluster InternalIP. Cleanup refused."
-    [[ -z "${seen_ips[$matched_ip]:-}" ]] || \
-      die "Configured InternalIP $matched_ip is registered by more than one Kubernetes Node. Cleanup refused."
-    seen_ips["$matched_ip"]="$node_name"
-    expected_name="${expected_names[$matched_ip]}"
-    [[ "$node_name" == "$expected_name" ]] || \
-      die "Node name mismatch for $matched_ip: API=$node_name, host=$expected_name. Cleanup refused."
-
-    role="$(KUBECONFIG=/etc/kubernetes/admin.conf kubectl get "$node" -o jsonpath='{.metadata.labels.pactllm-role}')"
-    api_cluster_id="$(KUBECONFIG=/etc/kubernetes/admin.conf kubectl get "$node" -o jsonpath='{.metadata.labels.pactllm-cluster-id}')"
-    if [[ -z "$role" && -z "$api_cluster_id" ]]; then
-      warn "Node $node_name has no PactLLM identity labels yet; markers and exact host/IP identity match a partial bootstrap."
-    else
-      [[ "$role" == "${expected_roles[$matched_ip]}" ]] || \
-        die "Node $node_name has role '${role:-missing}', expected '${expected_roles[$matched_ip]}'. Cleanup refused."
-      [[ "$api_cluster_id" == "$CLUSTER_ID" ]] || \
-        die "Node $node_name belongs to cluster ID '${api_cluster_id:-missing}', not '$CLUSTER_ID'. Cleanup refused."
-    fi
-  done < <(KUBECONFIG=/etc/kubernetes/admin.conf kubectl get nodes -o name)
-
-  for candidate_ip in "${!expected_roles[@]}"; do
-    if [[ -z "${seen_ips[$candidate_ip]:-}" ]]; then
-      warn "Marked node $candidate_ip is absent from the API; continuing for partial-cluster cleanup."
-    fi
   done
 }
 
@@ -471,6 +371,23 @@ delete_dynamo_custom_resources() {
     grep -E '^(dynamo|podsnapshots?(\.|$)|podsnapshotcontents?(\.|$))' || true)
 }
 
+delete_configured_nats_pvs() {
+  local pv_name storage_class local_path
+
+  while IFS='|' read -r pv_name storage_class local_path; do
+    [[ -n "$pv_name" ]] || continue
+    [[ "$storage_class" == "$DYNAMO_NATS_STORAGE_CLASS" ]] || continue
+    [[ "$local_path" == "$DYNAMO_NATS_STORAGE_PATH" ]] || continue
+    KUBECONFIG=/etc/kubernetes/admin.conf kubectl delete pv "$pv_name" \
+      --ignore-not-found --wait=false 2>/dev/null || \
+      warn "Failed to request deletion of configured NATS PV $pv_name; node reset will still remove cluster state."
+  done < <(
+    KUBECONFIG=/etc/kubernetes/admin.conf kubectl get pv \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.storageClassName}{"|"}{.spec.local.path}{"\n"}{end}' \
+      2>/dev/null || true
+  )
+}
+
 cleanup_cluster_resources() {
   local crd
 
@@ -509,7 +426,7 @@ cleanup_cluster_resources() {
     KUBECONFIG=/etc/kubernetes/admin.conf helm uninstall dynamo-platform -n "$DYNAMO_NAMESPACE" --wait --timeout=10m || warn 'Dynamo Helm uninstall reported an error; node reset will still remove etcd state.'
   fi
   KUBECONFIG=/etc/kubernetes/admin.conf kubectl delete namespace "$DYNAMO_NAMESPACE" --ignore-not-found --wait=false 2>/dev/null || true
-  KUBECONFIG=/etc/kubernetes/admin.conf kubectl delete pv pactllm-dynamo-nats --ignore-not-found --wait=false 2>/dev/null || true
+  delete_configured_nats_pvs
   KUBECONFIG=/etc/kubernetes/admin.conf kubectl delete storageclass "$DYNAMO_NATS_STORAGE_CLASS" --ignore-not-found 2>/dev/null || true
   while IFS= read -r crd; do
     [[ -n "$crd" ]] || continue
@@ -545,13 +462,53 @@ cleanup_cluster_resources() {
 delete_cni_interfaces() {
   local iface
 
-  for iface in cni0 flannel.1 tunl0 vxlan.calico vxlan-v6.calico wireguard.cali wg-v6.cali; do
+  # The kernel may recreate its fallback IPIP device as tunl0. Remove all
+  # Calico state from it, but do not require that empty fallback device itself
+  # to disappear.
+  if ip link show tunl0 >/dev/null 2>&1; then
+    ip -4 route flush dev tunl0 2>/dev/null || true
+    ip -6 route flush dev tunl0 2>/dev/null || true
+    ip -4 addr flush dev tunl0 2>/dev/null || true
+    ip -6 addr flush dev tunl0 2>/dev/null || true
+    ip link set tunl0 down 2>/dev/null || true
+    ip link delete tunl0 2>/dev/null || true
+  fi
+  for iface in cni0 flannel.1 vxlan.calico vxlan-v6.calico wireguard.cali wg-v6.cali; do
     ip link delete "$iface" 2>/dev/null || true
   done
   while IFS= read -r iface; do
     [[ -n "$iface" ]] || continue
     ip link delete "$iface" 2>/dev/null || true
   done < <(ip -o link show | awk -F': ' '$2 ~ /^cali/ { split($2, a, "@"); print a[1] }')
+}
+
+remove_matching_bootstrap_state() {
+  local expected_role="$1"
+  local expected_ip="$2"
+  local expected_version="$3"
+  local marker_file marker_dir marker_name prefix state_dir marker_uid marker_dir_uid
+
+  for marker_file in "${BOOTSTRAP_MARKER_SEARCH_ROOT}"/*-bootstrap/node.env; do
+    [[ -f "$marker_file" && ! -L "$marker_file" ]] || continue
+    marker_dir="${marker_file%/node.env}"
+    [[ -d "$marker_dir" && ! -L "$marker_dir" ]] || continue
+    marker_uid="$(stat -c '%u' "$marker_file" 2>/dev/null || true)"
+    marker_dir_uid="$(stat -c '%u' "$marker_dir" 2>/dev/null || true)"
+    [[ "$marker_uid" == "$BOOTSTRAP_MARKER_OWNER_UID" ]] || continue
+    [[ "$marker_dir_uid" == "$BOOTSTRAP_MARKER_OWNER_UID" ]] || continue
+
+    marker_name="${marker_dir##*/}"
+    prefix="${marker_name%-bootstrap}"
+    [[ "$marker_name" == "${prefix}-bootstrap" ]] || continue
+    [[ "$prefix" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
+    (( ${#prefix} <= 128 )) || continue
+    grep -Fxq "NODE_ROLE=${expected_role}" "$marker_file" || continue
+    grep -Fxq "NODE_IP=${expected_ip}" "$marker_file" || continue
+    grep -Fxq "KUBERNETES_VERSION=${expected_version}" "$marker_file" || continue
+
+    state_dir="${BOOTSTRAP_STATE_SEARCH_ROOT}/${prefix}-bootstrap"
+    rm -rf -- "$marker_dir" "$state_dir"
+  done
 }
 
 unmount_bootstrap_mounts() {
@@ -593,7 +550,7 @@ unmount_bootstrap_mounts() {
 
 cleanup_kube_proxy_rules() {
   local image="registry.k8s.io/kube-proxy:v${EXPECTED_KUBERNETES_VERSION}"
-  local container_id="pactllm-kube-proxy-cleanup-$$"
+  local container_id="prrw-kube-proxy-cleanup-$$"
 
   if [[ ! -x /usr/local/bin/ctr ]] || ! systemctl is-active --quiet containerd; then
     warn 'containerd is unavailable; kube-proxy iptables/nftables/IPVS cleanup was skipped.'
@@ -718,8 +675,15 @@ verify_node_cleanup() {
   if [[ -d /run/netns ]] && find /run/netns -maxdepth 1 -name 'cni-*' -print -quit | grep -q .; then
     die 'A Kubernetes CNI network namespace handle remains after cleanup.'
   fi
-  if ip -o link show | awk -F': ' '{print $2}' | grep -Eq '^(cali|cni0($|@)|tunl0($|@)|vxlan(-v6)?\.calico($|@)|wireguard\.cali($|@)|wg-v6\.cali($|@))'; then
+  if ip -o link show | awk -F': ' '{print $2}' | grep -Eq '^(cali|cni0($|@)|flannel\.1($|@)|vxlan(-v6)?\.calico($|@)|wireguard\.cali($|@)|wg-v6\.cali($|@))'; then
     die 'A Calico/CNI network interface remains after cleanup.'
+  fi
+  if ip link show tunl0 >/dev/null 2>&1 && {
+       ip -o addr show dev tunl0 2>/dev/null | grep -q . ||
+       ip -4 route show dev tunl0 2>/dev/null | grep -q . ||
+       ip -6 route show dev tunl0 2>/dev/null | grep -q .;
+     }; then
+    die 'The fallback tunl0 interface still carries Calico address or route state after cleanup.'
   fi
   for package in "${removed_packages[@]}"; do
     if dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null | grep -Eq '^(installed|config-files)$'; then
@@ -748,7 +712,7 @@ verify_node_cleanup() {
     (( gpu_count == EXPECTED_NVIDIA_GPU_COUNT_PER_WORKER )) || die 'The protected GPU backend no longer has exactly one RTX 3090.'
   fi
   if [[ "$node_kind" == 'control-plane' ]]; then
-    [[ ! -e "$EXPECTED_DYNAMO_NATS_STORAGE_PATH" ]] || die 'Dynamo NATS storage remains on the control plane.'
+    [[ ! -e "$DYNAMO_NATS_STORAGE_PATH" ]] || die 'Dynamo NATS storage remains on the control plane.'
     [[ ! -e /usr/local/bin/helm ]] || die 'The Helm binary installed by this bootstrap remains on the control plane.'
   fi
 }
@@ -772,6 +736,11 @@ cleanup_node() {
   unmount_bootstrap_mounts
 
   delete_cni_interfaces
+  if [[ "$node_kind" == 'gpu-backend-worker' ]]; then
+    remove_matching_bootstrap_state gpu-backend "$CLEANUP_NODE_IP" "$EXPECTED_KUBERNETES_VERSION"
+  else
+    remove_matching_bootstrap_state platform "$CONTROL_PLANE_IP" "$KUBERNETES_VERSION"
+  fi
   rm -rf \
     /etc/kubernetes \
     /var/lib/kubelet \
@@ -787,9 +756,9 @@ cleanup_node() {
     /var/log/pods \
     /var/log/containers \
     /opt/cni/bin \
-    /etc/systemd/system/kubelet.service.d
+    /etc/systemd/system/kubelet.service.d \
+    "$BOOTSTRAP_STATE_ROOT"
   if [[ "$node_kind" == 'control-plane' ]]; then
-    [[ "$DYNAMO_NATS_STORAGE_PATH" == "$EXPECTED_DYNAMO_NATS_STORAGE_PATH" ]] || die 'Refusing to remove an unexpected NATS storage path.'
     rm -rf -- /var/lib/etcd "$DYNAMO_NATS_STORAGE_PATH"
   fi
   rm -f \
@@ -810,7 +779,6 @@ cleanup_node() {
 
   hash -r
   verify_node_cleanup "$node_kind"
-  set_node_cleanup_state_cleaned
   printstyle "${node_kind} node cleanup verified.\n\n" success
 }
 
@@ -829,10 +797,6 @@ cleanup_remote_worker() {
 
   target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
   password="${WORKER_PASSWORDS[$index]}"
-  if [[ "${WORKER_CLEANUP_STATES[$index]}" == 'cleaned' ]]; then
-    printstyle "GPU backend worker $target was already cleaned in an earlier run; preserving its tombstone marker.\n" success
-    return 0
-  fi
   lineprint
   printstyle "Cleaning worker $target ...\n" info
 
@@ -842,7 +806,7 @@ cleanup_remote_worker() {
     die "Failed to transfer the cleanup script to $target. The control plane was not reset."
   fi
 
-  remote_privileged_command "$index" "chmod 700 '${REMOTE_CLEANUP_DIR}/cleanup.sh'; CLEANUP_NODE_ROLE='gpu-backend-worker' CLEANUP_CLUSTER_ID='${CLUSTER_ID}' CLEANUP_NODE_IP='${WORKER_IPS[$index]}' '${REMOTE_CLEANUP_DIR}/cleanup.sh'" || status=$?
+  remote_privileged_command "$index" "chmod 700 '${REMOTE_CLEANUP_DIR}/cleanup.sh'; CLEANUP_NODE_ROLE='gpu-backend-worker' CLEANUP_NODE_IP='${WORKER_IPS[$index]}' '${REMOTE_CLEANUP_DIR}/cleanup.sh'" || status=$?
   cleanup_remote_script "$index"
   (( status == 0 )) || die "Worker cleanup failed on $target. The control plane was not reset."
   printstyle "GPU backend worker $target cleanup completed; the NVIDIA Driver was preserved.\n\n" success
@@ -872,23 +836,69 @@ cleanup_master_files() {
   rm -rf -- "$BOOTSTRAP_STATE_ROOT"
 }
 
+rewrite_config_for_fresh_bootstrap() {
+  local config_target temp_file owner_group mode
+
+  config_target="$(readlink -f -- "$CONFIG_FILE")" || die 'Cannot resolve cluster.env for the post-cleanup update.'
+  [[ -f "$config_target" ]] || die 'cluster.env disappeared before the post-cleanup update.'
+  owner_group="$(stat -c '%u:%g' "$config_target")" || die 'Cannot read cluster.env ownership.'
+  mode="$(stat -c '%a' "$config_target")" || die 'Cannot read cluster.env permissions.'
+  temp_file="$(mktemp "${config_target}.tmp.XXXXXX")" || die 'Cannot create the temporary cluster.env update.'
+
+  if ! awk \
+    -v storage_class="$FRESH_DYNAMO_NATS_STORAGE_CLASS" \
+    -v storage_path="$FRESH_DYNAMO_NATS_STORAGE_PATH" '
+      BEGIN {
+        storage_class_written = 0
+        storage_path_written = 0
+      }
+      /^[[:space:]]*CLUSTER_ID[[:space:]]*=/ { next }
+      /^[[:space:]]*DYNAMO_NATS_STORAGE_CLASS[[:space:]]*=/ {
+        if (!storage_class_written) {
+          print "DYNAMO_NATS_STORAGE_CLASS=" storage_class
+        }
+        storage_class_written = 1
+        next
+      }
+      /^[[:space:]]*DYNAMO_NATS_STORAGE_PATH[[:space:]]*=/ {
+        if (!storage_path_written) {
+          print "DYNAMO_NATS_STORAGE_PATH=" storage_path
+        }
+        storage_path_written = 1
+        next
+      }
+      { print }
+      END {
+        if (!storage_class_written) {
+          print "DYNAMO_NATS_STORAGE_CLASS=" storage_class
+        }
+        if (!storage_path_written) {
+          print "DYNAMO_NATS_STORAGE_PATH=" storage_path
+        }
+      }
+    ' "$config_target" > "$temp_file"; then
+    rm -f -- "$temp_file"
+    die 'Failed to prepare the post-cleanup cluster.env update.'
+  fi
+  if ! chown "$owner_group" "$temp_file" || \
+     ! chmod "$mode" "$temp_file" || \
+     ! mv -f -- "$temp_file" "$config_target"; then
+    rm -f -- "$temp_file"
+    die 'Failed to atomically update cluster.env after cleanup.'
+  fi
+  printstyle 'cluster.env was prepared for the next fresh PRRW bootstrap.\n' success
+}
+
 main() {
   local cleanup_role="${CLEANUP_NODE_ROLE:-control-plane}"
   local index
 
   [[ "${EUID:-$(id -u)}" -eq 0 ]] || die 'Please run this cleanup script as root.'
   if [[ "$cleanup_role" == 'gpu-backend-worker' ]]; then
-    require_config_value CLEANUP_CLUSTER_ID
     require_config_value CLEANUP_NODE_IP
     valid_ipv4 "$CLEANUP_NODE_IP" || die 'Invalid internal cleanup node IP.'
-    validate_node_marker_file "$CLEANUP_CLUSTER_ID" "${cleanup_role%-worker}" "$CLEANUP_NODE_IP" || \
-      die 'The worker cleanup marker does not match the requested cluster, role, IP, and version.'
     ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "$CLEANUP_NODE_IP" || \
       die "This worker does not own CLEANUP_NODE_IP $CLEANUP_NODE_IP."
-    if [[ "$(node_cleanup_state)" == 'cleaned' ]]; then
-      printstyle "${cleanup_role} was already cleaned successfully; leaving its tombstone marker in place.\n" success
-      exit 0
-    fi
     cleanup_node "$cleanup_role"
     exit 0
   fi
@@ -899,7 +909,6 @@ main() {
   SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
   CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/cluster.env}"
   NODE_ROLE=''
-  CLUSTER_ID=''
   KUBERNETES_VERSION=''
   CONTAINERD_VERSION=''
   CALICO_VERSION=''
@@ -935,41 +944,26 @@ main() {
   declare -g -a WORKER_IPS=()
   declare -g -a WORKER_USERS=()
   declare -g -a WORKER_PASSWORDS=()
-  declare -g -a WORKER_HOSTNAMES=()
-  declare -g -a WORKER_CLEANUP_STATES=()
   declare -g -a SSH_OPTIONS=(-o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15)
   declare -g -a SCP_OPTIONS=(-o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
 
   load_config
-  for value_name in NODE_ROLE CLUSTER_ID KUBERNETES_VERSION CONTAINERD_VERSION CALICO_VERSION CONTROL_PLANE_IP GPU_WORKER_COUNT METRICS_SERVER_VERSION NVIDIA_DRIVER_VERSION NVIDIA_CONTAINER_TOOLKIT_VERSION NVIDIA_GPU_MEMORY_MIB GPU_OPERATOR_VERSION DYNAMO_PLATFORM_VERSION DYNAMO_NAMESPACE DYNAMO_NATS_STORAGE_CLASS DYNAMO_NATS_STORAGE_SIZE DYNAMO_NATS_STORAGE_PATH GATEWAY_API_VERSION GAIE_VERSION AGENTGATEWAY_VERSION AGENTGATEWAY_NAMESPACE; do
+  for value_name in NODE_ROLE KUBERNETES_VERSION CONTAINERD_VERSION CALICO_VERSION CONTROL_PLANE_IP GPU_WORKER_COUNT METRICS_SERVER_VERSION NVIDIA_DRIVER_VERSION NVIDIA_CONTAINER_TOOLKIT_VERSION NVIDIA_GPU_MEMORY_MIB GPU_OPERATOR_VERSION DYNAMO_PLATFORM_VERSION DYNAMO_NAMESPACE DYNAMO_NATS_STORAGE_CLASS DYNAMO_NATS_STORAGE_SIZE DYNAMO_NATS_STORAGE_PATH GATEWAY_API_VERSION GAIE_VERSION AGENTGATEWAY_VERSION AGENTGATEWAY_NAMESPACE; do
     require_config_value "$value_name"
   done
   validate_fixed_stack
-  valid_cluster_id "$CLUSTER_ID" || die 'CLUSTER_ID must be a lowercase RFC 4122 UUID.'
   collect_workers
   LOCAL_HOSTNAME="$(hostname -s)"
   [[ "$LOCAL_HOSTNAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || \
     die "The control-plane hostname is not a Kubernetes-safe DNS label: $LOCAL_HOSTNAME"
   ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "$CONTROL_PLANE_IP" || \
     die "This host does not own CONTROL_PLANE_IP $CONTROL_PLANE_IP. Cleanup refused."
-  validate_node_marker_file "$CLUSTER_ID" platform "$CONTROL_PLANE_IP" || \
-    die 'The control-plane marker does not match cluster.env, the platform role, and CONTROL_PLANE_IP. Cleanup refused.'
 
   command -v sshpass >/dev/null 2>&1 || die 'sshpass is required on the control plane.'
   command -v ssh >/dev/null 2>&1 || die 'ssh is required on the control plane.'
   command -v scp >/dev/null 2>&1 || die 'scp is required on the control plane.'
   prepare_ssh_state
   preflight_remote_workers
-  verify_api_inventory_if_available
-  if [[ "$(node_cleanup_state)" == 'cleaned' ]]; then
-    for index in "${!WORKER_CLEANUP_STATES[@]}"; do
-      [[ "${WORKER_CLEANUP_STATES[$index]}" == 'cleaned' ]] || \
-        die 'The control plane is marked cleaned but at least one worker is still active; refusing an inconsistent rerun.'
-    done
-    rm -rf -- "$BOOTSTRAP_STATE_ROOT"
-    printstyle 'Cluster cleanup had already completed successfully; all safety tombstone markers are intact.\n' success
-    exit 0
-  fi
   confirm_destruction
 
   cleanup_cluster_resources
@@ -981,10 +975,10 @@ main() {
   printstyle 'All workers are clean. Cleaning the control plane last ...\n' info
   cleanup_master_files
   cleanup_node control-plane
+  rewrite_config_for_fresh_bootstrap
 
   lineprint
   printstyle 'Cluster cleanup completed successfully.\n' success
-  printstyle "Safety tombstones were retained in ${NODE_MARKER_FILE} on all five nodes so an interrupted cleanup remains auditable and rerunnable.\n" success
   printstyle "Preserved component: NVIDIA Driver ${EXPECTED_NVIDIA_DRIVER_VERSION} on all four GPU backends.\n" success
   printstyle 'Not restored automatically: swap configuration and UFW state.\n' warning
   printstyle 'Reboot each worker, then reboot the control plane manually. After reboot, verify nvidia-smi on every GPU backend.\n' warning

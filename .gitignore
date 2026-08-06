@@ -88,6 +88,6 @@ $RECYCLE.BIN/
 
 # End of https://www.toptal.com/developers/gitignore/api/windows,macos,visualstudiocode,powershell
 
-# Local cluster configuration can contain SSH credentials.
+# Local PRRW cluster configuration can contain SSH credentials.
 cluster.env
 cluster-bootstrap-report.txt

@@ -9,7 +9,7 @@ controller:
   verticalPodAutoscaler: {}
 
 nodeSelector:
-  pactllm-role: platform
+  prrw-role: platform
 
 tolerations:
   - key: node-role.kubernetes.io/control-plane

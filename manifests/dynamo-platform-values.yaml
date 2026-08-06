@@ -29,7 +29,7 @@ dynamo-operator:
         requiredDuringSchedulingIgnoredDuringExecution:
           nodeSelectorTerms:
             - matchExpressions:
-                - key: pactllm-role
+                - key: prrw-role
                   operator: In
                   values:
                     - platform
@@ -53,7 +53,7 @@ nats:
     merge:
       spec:
         nodeSelector:
-          pactllm-role: platform
+          prrw-role: platform
         tolerations:
           - key: node-role.kubernetes.io/control-plane
             operator: Exists
