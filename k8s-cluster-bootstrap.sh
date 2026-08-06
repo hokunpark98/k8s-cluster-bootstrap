@@ -318,7 +318,9 @@ install_containerd() {
   mkdir -p /etc/containerd
   /usr/local/bin/containerd config default > /etc/containerd/config.toml
   sed -i 's/            SystemdCgroup = false/            SystemdCgroup = true/' /etc/containerd/config.toml
+  sed -i -E "s#^([[:space:]]*sandbox_image = ).*#\\1\"${SANDBOX_IMAGE}\"#" /etc/containerd/config.toml
   grep -Fq 'SystemdCgroup = true' /etc/containerd/config.toml || die 'Failed to enable SystemdCgroup in containerd.'
+  grep -Fq "sandbox_image = \"${SANDBOX_IMAGE}\"" /etc/containerd/config.toml || die 'Failed to configure the Kubernetes pause image in containerd.'
 
   systemctl daemon-reload
   systemctl enable --now containerd
@@ -338,7 +340,9 @@ install_nvidia_container_toolkit() {
     libnvidia-container1
   )
 
-  [[ "$INSTALL_NVIDIA_STACK" == 'true' ]] || return
+  if [[ "$INSTALL_NVIDIA_STACK" != 'true' ]]; then
+    return 0
+  fi
   lineprint
   printstyle "Installing exact NVIDIA Container Toolkit v${NVIDIA_CONTAINER_TOOLKIT_VERSION} ...\n" info
 
@@ -382,7 +386,7 @@ install_kubernetes() {
   lineprint
   printstyle "Installing exact Kubernetes v${KUBERNETES_VERSION} ...\n" info
 
-  mkdir -p -m 755 /etc/apt/keyrings
+  install -d -m 0755 /etc/apt/keyrings
   curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${KUBERNETES_MINOR_VERSION}/deb/Release.key" | gpg --yes --dearmor -o "$keyring"
   printf 'deb [signed-by=%s] https://pkgs.k8s.io/core:/stable:/v%s/deb/ /\n' "$keyring" "$KUBERNETES_MINOR_VERSION" > "$repository"
   apt-get update
@@ -461,6 +465,7 @@ initialize_control_plane() {
     "--kubernetes-version=v${KUBERNETES_VERSION}"
     "--apiserver-advertise-address=${CONTROL_PLANE_IP}"
     "--cri-socket=${CRI_SOCKET}"
+    '--skip-token-print'
   )
   if [[ "$INSTALL_CALICO" == 'true' ]]; then
     init_args+=("--pod-network-cidr=${POD_CIDR}")
@@ -473,7 +478,9 @@ initialize_control_plane() {
 install_calico() {
   local manifest
 
-  [[ "$INSTALL_CALICO" == 'true' ]] || return
+  if [[ "$INSTALL_CALICO" != 'true' ]]; then
+    return 0
+  fi
   lineprint
   printstyle "Installing exact Calico v${CALICO_VERSION} ...\n" info
 
@@ -493,7 +500,9 @@ install_calico() {
 install_metrics_server() {
   local manifest
 
-  [[ "$INSTALL_METRICS_SERVER" == 'true' ]] || return
+  if [[ "$INSTALL_METRICS_SERVER" != 'true' ]]; then
+    return 0
+  fi
   lineprint
   printstyle 'Installing metrics-server ...\n' info
   manifest="$(mktemp)"
@@ -572,7 +581,9 @@ verify_gpu_resources() {
 install_gpu_operator() {
   local deployment daemonset
 
-  [[ "$INSTALL_NVIDIA_STACK" == 'true' ]] || return
+  if [[ "$INSTALL_NVIDIA_STACK" != 'true' ]]; then
+    return 0
+  fi
   [[ -f "$GPU_OPERATOR_VALUES_FILE" ]] || die "GPU Operator values file not found: $GPU_OPERATOR_VALUES_FILE"
   lineprint
   printstyle "Installing exact GPU Operator v${GPU_OPERATOR_VERSION} ...\n" info
@@ -606,7 +617,9 @@ install_gpu_operator() {
 install_dynamo_platform() {
   local resource images
 
-  [[ "$INSTALL_DYNAMO_PLATFORM" == 'true' ]] || return
+  if [[ "$INSTALL_DYNAMO_PLATFORM" != 'true' ]]; then
+    return 0
+  fi
   [[ -f "$DYNAMO_PLATFORM_VALUES_FILE" ]] || die "Dynamo Platform values file not found: $DYNAMO_PLATFORM_VALUES_FILE"
   lineprint
   printstyle "Installing exact Dynamo Platform v${DYNAMO_PLATFORM_VERSION} ...\n" info
@@ -636,7 +649,9 @@ install_dynamo_platform() {
 prepull_dynamo_vllm_runtime() {
   local index target pull_command
 
-  [[ "$INSTALL_DYNAMO_PLATFORM" == 'true' && "$PREPULL_DYNAMO_VLLM_IMAGE" == 'true' ]] || return
+  if [[ "$INSTALL_DYNAMO_PLATFORM" != 'true' || "$PREPULL_DYNAMO_VLLM_IMAGE" != 'true' ]]; then
+    return 0
+  fi
   lineprint
   printstyle "Pre-pulling Dynamo vLLM runtime image on every GPU worker: ${DYNAMO_VLLM_IMAGE} ...\n" info
   for index in "${!WORKER_IPS[@]}"; do
@@ -810,6 +825,7 @@ MANIFEST_DIR="$SCRIPT_DIR/manifests"
 GPU_OPERATOR_VALUES_FILE="$MANIFEST_DIR/gpu-operator-values.yaml"
 DYNAMO_PLATFORM_VALUES_FILE="$MANIFEST_DIR/dynamo-platform-values.yaml"
 CRI_SOCKET='unix:///run/containerd/containerd.sock'
+SANDBOX_IMAGE='registry.k8s.io/pause:3.10.1'
 NODE_ROLE=''
 KUBERNETES_VERSION=''
 CONTAINERD_VERSION=''
@@ -902,6 +918,8 @@ case "$NODE_ROLE" in
     install_calico
     install_metrics_server
 
+    lineprint
+    printstyle "Provisioning and joining ${WORKER_COUNT} worker node(s) over SSH ...\n" info
     JOIN_COMMAND="$(kubeadm token create --print-join-command) --cri-socket=${CRI_SOCKET}"
     [[ -n "$JOIN_COMMAND" ]] || die 'Failed to create the worker join command.'
     for index in "${!WORKER_IPS[@]}"; do
