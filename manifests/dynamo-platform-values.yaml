@@ -1,0 +1,5 @@
+# Cluster-wide is the supported production mode. DGD and model settings are
+# intentionally not part of the platform installation.
+dynamo-operator:
+  namespaceRestriction:
+    enabled: false

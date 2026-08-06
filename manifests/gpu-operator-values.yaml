@@ -1,0 +1,11 @@
+# The preinstalled host driver is verified, and NVIDIA Container Toolkit is
+# installed and verified by k8s-cluster-bootstrap.sh before this chart.
+driver:
+  enabled: false
+
+toolkit:
+  enabled: false
+
+# RTX 3090 workers do not use MIG or GPU sharing.
+mig:
+  strategy: none
