@@ -236,16 +236,16 @@ preflight_remote_workers() {
 }
 
 confirm_destruction() {
-  local expected confirmation
+  local confirmation
 
-  expected="DESTROY ${CONTROL_PLANE_IP}"
   [[ -t 0 ]] || die "Interactive confirmation is required. Run this cleanup from a terminal."
   lineprint
   printstyle 'WARNING: This permanently deletes Kubernetes, containerd data/images, NVIDIA Container Toolkit, GPU Operator, and Dynamo from every configured node.\n' danger
   printstyle "NVIDIA Driver ${EXPECTED_NVIDIA_DRIVER_VERSION} is the only NVIDIA component that will be preserved.\n" warning
-  printf 'Type exactly "%s" to continue: ' "$expected"
-  read -r confirmation
-  [[ "$confirmation" == "$expected" ]] || die 'Confirmation did not match. Nothing was deleted.'
+  printf 'Continue with cluster cleanup? [y/N]: '
+  read -r -n 1 confirmation
+  printf '\n'
+  [[ "${confirmation,,}" == 'y' ]] || die 'Cleanup cancelled. Nothing was deleted.'
 }
 
 cluster_api_available() {
@@ -320,6 +320,24 @@ delete_cni_interfaces() {
     [[ -n "$iface" ]] || continue
     ip link delete "$iface" 2>/dev/null || true
   done < <(ip -o link show | awk -F': ' '$2 ~ /^cali/ { split($2, a, "@"); print a[1] }')
+}
+
+unmount_calico_cgroup() {
+  local target='/var/run/calico/cgroup'
+
+  if ! mountpoint -q -- "$target"; then
+    return 0
+  fi
+
+  printstyle "Unmounting Calico cgroup mount at ${target} ...\n" info
+  if ! umount --recursive "$target"; then
+    warn "Normal unmount failed for $target; detaching the stale Calico mount lazily."
+    umount --lazy "$target" || die "Failed to detach the Calico cgroup mount at $target."
+  fi
+  if mountpoint -q -- "$target"; then
+    die "Calico cgroup mount is still active at $target."
+  fi
+  return 0
 }
 
 purge_known_packages() {
@@ -446,6 +464,8 @@ cleanup_node() {
     crictl --runtime-endpoint "$CRI_SOCKET" rm -fa >/dev/null 2>&1 || true
     crictl --runtime-endpoint "$CRI_SOCKET" rmp -fa >/dev/null 2>&1 || true
   fi
+  systemctl stop containerd >/dev/null 2>&1 || true
+  unmount_calico_cgroup
 
   delete_cni_interfaces
   rm -rf \
