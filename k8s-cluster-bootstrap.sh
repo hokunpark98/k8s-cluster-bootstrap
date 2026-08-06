@@ -100,11 +100,11 @@ load_config() {
     fi
 
     case "$key" in
-      NODE_ROLE|CLUSTER_ID|KUBELET_NODE_IP|KUBERNETES_VERSION|CONTAINERD_VERSION|CALICO_VERSION|HELM_VERSION|CONTROL_PLANE_IP|POD_CIDR|INSTALL_CALICO|INSTALL_METRICS_SERVER|METRICS_SERVER_VERSION|REGULAR_USER_HOME|ROUTER_WORKER_COUNT|GPU_WORKER_COUNT|JOIN_COMMAND_BASE64|INSTALL_NVIDIA_STACK|NVIDIA_DRIVER_VERSION|NVIDIA_CONTAINER_TOOLKIT_VERSION|NVIDIA_GPU_MODEL|NVIDIA_GPU_MEMORY_MIB|NVIDIA_GPU_COUNT_PER_WORKER|GPU_OPERATOR_VERSION|INSTALL_DYNAMO_PLATFORM|DYNAMO_PLATFORM_VERSION|DYNAMO_VLLM_VERSION|DYNAMO_VLLM_IMAGE|DYNAMO_NAMESPACE|DYNAMO_NATS_STORAGE_CLASS|DYNAMO_NATS_STORAGE_SIZE|DYNAMO_NATS_STORAGE_PATH|PREPULL_DYNAMO_VLLM_IMAGE|INSTALL_GATEWAY_FOUNDATION|GATEWAY_API_VERSION|GAIE_VERSION|AGENTGATEWAY_VERSION|AGENTGATEWAY_NAMESPACE)
+      NODE_ROLE|CLUSTER_ID|KUBELET_NODE_IP|KUBERNETES_VERSION|CONTAINERD_VERSION|CALICO_VERSION|HELM_VERSION|CONTROL_PLANE_IP|POD_CIDR|INSTALL_CALICO|INSTALL_METRICS_SERVER|METRICS_SERVER_VERSION|REGULAR_USER_HOME|GPU_WORKER_COUNT|JOIN_COMMAND_BASE64|INSTALL_NVIDIA_STACK|NVIDIA_DRIVER_VERSION|NVIDIA_CONTAINER_TOOLKIT_VERSION|NVIDIA_GPU_MODEL|NVIDIA_GPU_MEMORY_MIB|NVIDIA_GPU_COUNT_PER_WORKER|GPU_OPERATOR_VERSION|INSTALL_DYNAMO_PLATFORM|DYNAMO_PLATFORM_VERSION|DYNAMO_VLLM_VERSION|DYNAMO_VLLM_IMAGE|DYNAMO_NAMESPACE|DYNAMO_NATS_STORAGE_CLASS|DYNAMO_NATS_STORAGE_SIZE|DYNAMO_NATS_STORAGE_PATH|PREPULL_DYNAMO_VLLM_IMAGE|INSTALL_GATEWAY_FOUNDATION|GATEWAY_API_VERSION|GAIE_VERSION|AGENTGATEWAY_VERSION|AGENTGATEWAY_NAMESPACE)
         printf -v "$key" '%s' "$value"
         ;;
       *)
-        if [[ "$key" =~ ^(ROUTER|GPU)_WORKER_[1-9][0-9]*_(IP|SSH_USER|SSH_PASSWORD)$ ]]; then
+        if [[ "$key" =~ ^GPU_WORKER_[1-4]_(IP|SSH_USER|SSH_PASSWORD)$ ]]; then
           printf -v "$key" '%s' "$value"
         else
           die "Unknown configuration key: $key"
@@ -274,63 +274,42 @@ validate_fixed_research_stack() {
 }
 
 collect_workers() {
-  local group role count_var count index ip_var user_var password_var ip user password worker_index
+  local index ip_var user_var password_var ip user password worker_index
   declare -A seen_ips=()
 
-  prompt_if_empty ROUTER_WORKER_COUNT 'Router worker node count: '
   prompt_if_empty GPU_WORKER_COUNT 'GPU backend worker node count: '
-  [[ "$ROUTER_WORKER_COUNT" =~ ^[0-9]+$ ]] || die 'ROUTER_WORKER_COUNT must be zero or a positive integer.'
   [[ "$GPU_WORKER_COUNT" =~ ^[0-9]+$ ]] || die 'GPU_WORKER_COUNT must be zero or a positive integer.'
-  ROUTER_WORKER_COUNT="$((10#$ROUTER_WORKER_COUNT))"
   GPU_WORKER_COUNT="$((10#$GPU_WORKER_COUNT))"
-  (( ROUTER_WORKER_COUNT == 2 )) || die 'This research topology requires exactly 2 router workers.'
   (( GPU_WORKER_COUNT == 4 )) || die 'This research topology requires exactly 4 GPU backend workers.'
 
-  for group in ROUTER GPU; do
-    if [[ "$group" == 'ROUTER' ]]; then
-      role='router'
-      count_var='ROUTER_WORKER_COUNT'
-    else
-      role='gpu-backend'
-      count_var='GPU_WORKER_COUNT'
-    fi
-    count="${!count_var}"
+  for ((index = 1; index <= GPU_WORKER_COUNT; index++)); do
+    ip_var="GPU_WORKER_${index}_IP"
+    user_var="GPU_WORKER_${index}_SSH_USER"
+    password_var="GPU_WORKER_${index}_SSH_PASSWORD"
 
-    for ((index = 1; index <= count; index++)); do
-      ip_var="${group}_WORKER_${index}_IP"
-      user_var="${group}_WORKER_${index}_SSH_USER"
-      password_var="${group}_WORKER_${index}_SSH_PASSWORD"
+    prompt_if_empty "$ip_var" "GPU backend worker ${index} IP: "
+    prompt_if_empty "$user_var" "GPU backend worker ${index} SSH username: "
+    prompt_if_empty "$password_var" "GPU backend worker ${index} SSH/sudo password: " true
 
-      prompt_if_empty "$ip_var" "${role} worker ${index} IP: "
-      prompt_if_empty "$user_var" "${role} worker ${index} SSH username: "
-      prompt_if_empty "$password_var" "${role} worker ${index} SSH/sudo password: " true
+    ip="${!ip_var}"
+    user="${!user_var}"
+    password="${!password_var}"
 
-      ip="${!ip_var}"
-      user="${!user_var}"
-      password="${!password_var}"
+    valid_ipv4 "$ip" || die "Invalid GPU backend worker IP: $ip"
+    [[ "$ip" != "$CONTROL_PLANE_IP" ]] || die "Worker IP cannot equal the control-plane IP: $ip"
+    [[ -z "${seen_ips[$ip]:-}" ]] || die "Duplicate worker IP: $ip"
+    [[ "$user" =~ ^[a-z_][a-z0-9_-]*\$?$ ]] || die "Invalid SSH username for GPU backend worker $index: $user"
+    [[ "$user" == 'dnclab' ]] || die "GPU backend worker $index SSH username is fixed to dnclab."
+    [[ "$ip" == "192.168.0.$((10 + index))" ]] || \
+      die "GPU backend worker $index IP is fixed to 192.168.0.$((10 + index))."
+    seen_ips["$ip"]=1
 
-      valid_ipv4 "$ip" || die "Invalid ${role} worker IP: $ip"
-      [[ "$ip" != "$CONTROL_PLANE_IP" ]] || die "Worker IP cannot equal the control-plane IP: $ip"
-      [[ -z "${seen_ips[$ip]:-}" ]] || die "Duplicate worker IP: $ip"
-      [[ "$user" =~ ^[a-z_][a-z0-9_-]*\$?$ ]] || die "Invalid SSH username for ${role} worker $index: $user"
-      [[ "$user" == 'dnclab' ]] || die "${role} worker $index SSH username is fixed to dnclab."
-      if [[ "$role" == 'gpu-backend' ]]; then
-        [[ "$ip" == "192.168.0.$((10 + index))" ]] || \
-          die "GPU backend worker $index IP is fixed to 192.168.0.$((10 + index))."
-      fi
-      seen_ips["$ip"]=1
-
-      WORKER_IPS+=("$ip")
-      WORKER_USERS+=("$user")
-      WORKER_PASSWORDS+=("$password")
-      WORKER_ROLES+=("$role")
-      worker_index=$((${#WORKER_IPS[@]} - 1))
-      if [[ "$role" == 'gpu-backend' ]]; then
-        GPU_WORKER_INDICES+=("$worker_index")
-      else
-        ROUTER_WORKER_INDICES+=("$worker_index")
-      fi
-    done
+    WORKER_IPS+=("$ip")
+    WORKER_USERS+=("$user")
+    WORKER_PASSWORDS+=("$password")
+    WORKER_ROLES+=('gpu-backend')
+    worker_index=$((${#WORKER_IPS[@]} - 1))
+    GPU_WORKER_INDICES+=("$worker_index")
   done
 }
 
@@ -481,7 +460,7 @@ stage_node_markers() {
       die "Failed to stage the bootstrap marker on ${WORKER_USERS[$index]}@${ip}. No cluster installation was started."
     fi
   done
-  printstyle "Staged cluster identity ${CLUSTER_ID} on the platform and all six workers.\n" success
+  printstyle "Staged cluster identity ${CLUSTER_ID} on the platform and all four GPU workers.\n" success
 }
 
 prepare_ssh_state() {
@@ -545,26 +524,6 @@ preflight_remote_gpu() {
   printstyle "GPU preflight passed on $target: ${gpu_count}x ${NVIDIA_GPU_MODEL} (${NVIDIA_GPU_MEMORY_MIB} MiB), driver ${NVIDIA_DRIVER_VERSION}.\n" success
 }
 
-preflight_remote_router() {
-  local index="$1"
-  local target password inventory line gpu_name driver_version
-
-  target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
-  password="${WORKER_PASSWORDS[$index]}"
-  inventory="$(SSHPASS="$password" sshpass -e ssh "${SSH_OPTIONS[@]}" "$target" \
-    "nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || true")"
-  if [[ -n "$inventory" ]]; then
-    while IFS=',' read -r gpu_name driver_version; do
-      driver_version="${driver_version#"${driver_version%%[![:space:]]*}"}"
-      driver_version="${driver_version%"${driver_version##*[![:space:]]}"}"
-      [[ "$driver_version" == "$NVIDIA_DRIVER_VERSION" ]] || die "Router $target has NVIDIA Driver $driver_version; expected $NVIDIA_DRIVER_VERSION."
-    done <<< "$inventory"
-    printstyle "Router preflight on $target: host GPU detected with Driver ${NVIDIA_DRIVER_VERSION}, but intentionally excluded from Kubernetes operands.\n" warning
-  else
-    printstyle "Router preflight passed on $target: no Kubernetes GPU prerequisite is required.\n" success
-  fi
-}
-
 preflight_remote_access() {
   local require_unjoined="${1:-true}"
   local index target password user facts facts_command os_id os_version architecture hostname_short owned_ip ntp_synced remote_epoch local_epoch skew
@@ -612,10 +571,8 @@ preflight_remote_access() {
     else
       verify_remote_marker "$index" || die "Worker $target has no matching root-owned cluster marker. Refusing to resume against it."
     fi
-    if [[ "$INSTALL_NVIDIA_STACK" == 'true' && "${WORKER_ROLES[$index]}" == 'gpu-backend' ]]; then
+    if [[ "$INSTALL_NVIDIA_STACK" == 'true' ]]; then
       preflight_remote_gpu "$index"
-    elif [[ "${WORKER_ROLES[$index]}" == 'router' ]]; then
-      preflight_remote_router "$index"
     fi
   done
 }
@@ -959,7 +916,7 @@ pin_core_cluster_services() {
 }
 
 label_cluster_nodes() {
-  local control_plane_node index worker_node role router_ordinal=0 gpu_ordinal=0
+  local control_plane_node index worker_node gpu_ordinal=0
 
   lineprint
   printstyle 'Applying fixed research node roles before GPU Operator installation ...\n' info
@@ -972,34 +929,21 @@ label_cluster_nodes() {
 
   for index in "${!WORKER_IPS[@]}"; do
     worker_node="$(node_name_for_ip "${WORKER_IPS[$index]}")" || die "No Kubernetes node owns worker IP ${WORKER_IPS[$index]}."
-    role="${WORKER_ROLES[$index]}"
-    if [[ "$role" == 'router' ]]; then
-      router_ordinal=$((router_ordinal + 1))
-      kubectl label node "$worker_node" \
-        pactllm-role=router \
-        pactllm-cluster-id="$CLUSTER_ID" \
-        pactllm-router-index="$router_ordinal" \
-        nvidia.com/gpu.deploy.operands=false \
-        --overwrite
-      kubectl label node "$worker_node" pactllm-backend-index- pactllm-gpu-model- 2>/dev/null || true
-    else
-      gpu_ordinal=$((gpu_ordinal + 1))
-      kubectl label node "$worker_node" \
-        pactllm-role=gpu-backend \
-        pactllm-cluster-id="$CLUSTER_ID" \
-        pactllm-backend-index="$gpu_ordinal" \
-        pactllm-gpu-model=rtx3090 \
-        --overwrite
-      kubectl label node "$worker_node" nvidia.com/gpu.deploy.operands- pactllm-router-index- 2>/dev/null || true
-    fi
+    gpu_ordinal=$((gpu_ordinal + 1))
+    kubectl label node "$worker_node" \
+      pactllm-role=gpu-backend \
+      pactllm-cluster-id="$CLUSTER_ID" \
+      pactllm-backend-index="$gpu_ordinal" \
+      pactllm-gpu-model=rtx3090 \
+      --overwrite
+    kubectl label node "$worker_node" nvidia.com/gpu.deploy.operands- 2>/dev/null || true
   done
 
   [[ "$(kubectl get nodes -l pactllm-role=platform --no-headers | wc -l | tr -d '[:space:]')" == '1' ]] || die 'Expected exactly one platform node.'
-  [[ "$(kubectl get nodes -l pactllm-role=router --no-headers | wc -l | tr -d '[:space:]')" == "$ROUTER_WORKER_COUNT" ]] || die 'Router node labeling failed.'
   [[ "$(kubectl get nodes -l pactllm-role=gpu-backend --no-headers | wc -l | tr -d '[:space:]')" == "$GPU_WORKER_COUNT" ]] || die 'GPU backend node labeling failed.'
-  [[ "$(kubectl get nodes -l "pactllm-cluster-id=${CLUSTER_ID}" --no-headers | wc -l | tr -d '[:space:]')" == "$((ROUTER_WORKER_COUNT + GPU_WORKER_COUNT + 1))" ]] || \
+  [[ "$(kubectl get nodes -l "pactllm-cluster-id=${CLUSTER_ID}" --no-headers | wc -l | tr -d '[:space:]')" == "$((GPU_WORKER_COUNT + 1))" ]] || \
     die 'Cluster identity labeling failed.'
-  printstyle 'Node roles and stable experiment indices applied: 1 platform, routers 1-2, GPU backends 1-4.\n\n' success
+  printstyle 'Node roles and stable experiment indices applied: 1 platform and GPU backends 1-4.\n\n' success
 }
 
 prepare_dynamo_nats_storage() {
@@ -1092,7 +1036,7 @@ wait_for_cluster_policy() {
 }
 
 verify_gpu_resources() {
-  local inventory line node_name role gpu_count gpu_nodes=0 router_nodes=0 total_gpus=0
+  local inventory line node_name role gpu_count gpu_nodes=0 total_gpus=0
   local expected_total=$((GPU_WORKER_COUNT * NVIDIA_GPU_COUNT_PER_WORKER))
 
   inventory="$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"="}{.metadata.labels.pactllm-role}{"="}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}')" || \
@@ -1109,9 +1053,6 @@ verify_gpu_resources() {
         die "GPU backend $node_name exposes $gpu_count GPUs; expected $NVIDIA_GPU_COUNT_PER_WORKER."
       gpu_nodes=$((gpu_nodes + 1))
       total_gpus=$((total_gpus + gpu_count))
-    elif [[ "$role" == 'router' ]]; then
-      [[ -z "$gpu_count" || "$gpu_count" == '0' ]] || die "Router node $node_name unexpectedly exposes $gpu_count NVIDIA GPUs."
-      router_nodes=$((router_nodes + 1))
     elif [[ "$role" == 'platform' ]]; then
       [[ -z "$gpu_count" || "$gpu_count" == '0' ]] || die "Platform node $node_name unexpectedly exposes $gpu_count NVIDIA GPUs."
     else
@@ -1120,9 +1061,8 @@ verify_gpu_resources() {
   done <<< "$inventory"
 
   (( gpu_nodes == GPU_WORKER_COUNT )) || die "Kubernetes reports $gpu_nodes GPU backend nodes; expected $GPU_WORKER_COUNT."
-  (( router_nodes == ROUTER_WORKER_COUNT )) || die "Kubernetes reports $router_nodes router nodes; expected $ROUTER_WORKER_COUNT."
   (( total_gpus == expected_total )) || die "Kubernetes reports $total_gpus allocatable GPUs; expected $expected_total."
-  printstyle "Kubernetes GPU resources verified: ${gpu_nodes} RTX 3090 backend nodes and ${total_gpus} GPUs; router GPUs exposed: 0.\n" success
+  printstyle "Kubernetes GPU resources verified: ${gpu_nodes} RTX 3090 backend nodes and ${total_gpus} GPUs; platform GPUs exposed: 0.\n" success
 }
 
 install_gpu_operator() {
@@ -1633,7 +1573,7 @@ write_environment_report() {
     printf 'cluster_id=%s\n' "$CLUSTER_ID"
     printf 'control_plane_ip=%s\n' "$CONTROL_PLANE_IP"
     printf 'clock_policy=all nodes NTP synchronized, maximum observed preflight skew <= %ss\n' "$MAX_CLOCK_SKEW_SECONDS"
-    printf 'topology=1 platform + %s router + %s gpu-backend\n' "$ROUTER_WORKER_COUNT" "$GPU_WORKER_COUNT"
+    printf 'topology=1 platform + %s gpu-backend\n' "$GPU_WORKER_COUNT"
     printf 'kubernetes=%s\ncontainerd=%s\ncalico=%s\nhelm=%s\nmetrics_server=%s\n' "$KUBERNETES_VERSION" "$CONTAINERD_VERSION" "$CALICO_VERSION" "$HELM_VERSION" "$METRICS_SERVER_VERSION"
     printf 'nvidia_driver=%s\nnvidia_container_toolkit=%s\ngpu_operator=%s\n' "$NVIDIA_DRIVER_VERSION" "$NVIDIA_CONTAINER_TOOLKIT_VERSION" "$GPU_OPERATOR_VERSION"
     printf 'dynamo_platform=%s\ndynamo_vllm=%s\ndynamo_vllm_image=%s\n' "$DYNAMO_PLATFORM_VERSION" "$DYNAMO_VLLM_VERSION" "$DYNAMO_VLLM_IMAGE"
@@ -1641,7 +1581,7 @@ write_environment_report() {
     printf 'validated_cuda_runtime=13.0\n'
     printf 'gateway_api=%s\ngaie=%s\nagentgateway=%s\n' "$GATEWAY_API_VERSION" "$GAIE_VERSION" "$AGENTGATEWAY_VERSION"
     printf '\n[NODES]\n'
-    kubectl get nodes -L pactllm-role,pactllm-router-index,pactllm-backend-index,pactllm-gpu-model -o wide
+    kubectl get nodes -L pactllm-role,pactllm-backend-index,pactllm-gpu-model -o wide
     printf '\n[GPU ALLOCATABLE]\n'
     kubectl get nodes -o custom-columns='NAME:.metadata.name,ROLE:.metadata.labels.pactllm-role,GPU:.status.allocatable.nvidia\.com/gpu'
     printf '\n[RUNTIME CLASSES]\n'
@@ -1701,7 +1641,7 @@ cleanup_remote_worker_files() {
 install_remote_worker() {
   local index="$1"
   local join_command="$2"
-  local target password remote_dir local_config join_base64 remote_command status worker_role worker_nvidia_stack
+  local target password remote_dir local_config join_base64 remote_command status worker_role
 
   target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
   password="${WORKER_PASSWORDS[$index]}"
@@ -1710,11 +1650,7 @@ install_remote_worker() {
   LOCAL_TEMP_PATHS+=("$local_config")
   join_base64="$(printf '%s' "$join_command" | base64 -w0)"
   worker_role="${WORKER_ROLES[$index]}"
-  if [[ "$worker_role" == 'gpu-backend' ]]; then
-    worker_nvidia_stack="$INSTALL_NVIDIA_STACK"
-  else
-    worker_nvidia_stack='false'
-  fi
+  [[ "$worker_role" == 'gpu-backend' ]] || die "Unexpected worker role for ${WORKER_IPS[$index]}: $worker_role"
 
   {
     printf 'NODE_ROLE=%s-worker\n' "$worker_role"
@@ -1730,9 +1666,8 @@ install_remote_worker() {
     printf 'INSTALL_METRICS_SERVER=false\n'
     printf 'METRICS_SERVER_VERSION=%s\n' "$METRICS_SERVER_VERSION"
     printf 'REGULAR_USER_HOME=\n'
-    printf 'ROUTER_WORKER_COUNT=0\n'
     printf 'GPU_WORKER_COUNT=0\n'
-    printf 'INSTALL_NVIDIA_STACK=%s\n' "$worker_nvidia_stack"
+    printf 'INSTALL_NVIDIA_STACK=%s\n' "$INSTALL_NVIDIA_STACK"
     printf 'NVIDIA_DRIVER_VERSION=%s\n' "$NVIDIA_DRIVER_VERSION"
     printf 'NVIDIA_CONTAINER_TOOLKIT_VERSION=%s\n' "$NVIDIA_CONTAINER_TOOLKIT_VERSION"
     printf 'NVIDIA_GPU_MODEL=%s\n' "$NVIDIA_GPU_MODEL"
@@ -1815,7 +1750,7 @@ verify_cluster() {
   local timeout='600s'
   local expected_nodes actual_nodes api_status calico_node_image metrics_server_image kubelet_versions runtime_versions metrics_nodes metrics_output deadline
 
-  expected_nodes=$((ROUTER_WORKER_COUNT + GPU_WORKER_COUNT + 1))
+  expected_nodes=$((GPU_WORKER_COUNT + 1))
   lineprint
   printstyle 'Verifying the completed cluster ...\n' info
 
@@ -1897,10 +1832,10 @@ cleanup_network_smoke_pods() {
 }
 
 verify_cross_node_network() {
-  local index ordinal=0 node_name pod_name server_ips='' output
+  local index ordinal=0 node_name pod_name server_ips='' output control_plane_node client_count
 
   lineprint
-  printstyle 'Testing Kubernetes DNS and every router-to-GPU Pod TCP path ...\n' info
+  printstyle 'Testing Kubernetes DNS plus platform-to-GPU and GPU-to-GPU Pod TCP paths ...\n' info
   cleanup_network_smoke_pods
 
   for index in "${GPU_WORKER_INDICES[@]}"; do
@@ -1938,11 +1873,37 @@ EOF
     die 'Not every GPU-side network smoke pod received an IP.'
   }
 
+  control_plane_node="$(node_name_for_ip "$CONTROL_PLANE_IP")" || die 'Cannot resolve the platform node for network smoke testing.'
+  kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pactllm-network-client-platform
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: pactllm-network-client
+    app.kubernetes.io/part-of: pactllm-network-smoke
+spec:
+  restartPolicy: Never
+  nodeName: ${control_plane_node}
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: checks
+      image: ${NETWORK_SMOKE_IMAGE}
+      imagePullPolicy: IfNotPresent
+      command: [/bin/sh, -c]
+      args:
+        - 'set -eu; nslookup kubernetes.default.svc.cluster.local >/dev/null; for endpoint in ${server_ips}; do wget -q -T 10 -O /dev/null "http://\${endpoint}:18080/health"; echo "TCP_OK=\${endpoint}"; done'
+EOF
+
   ordinal=0
-  for index in "${ROUTER_WORKER_INDICES[@]}"; do
+  for index in "${GPU_WORKER_INDICES[@]}"; do
     ordinal=$((ordinal + 1))
-    node_name="$(node_name_for_ip "${WORKER_IPS[$index]}")" || die "Cannot resolve router ${WORKER_IPS[$index]} for network smoke testing."
-    pod_name="pactllm-network-client-${ordinal}"
+    node_name="$(node_name_for_ip "${WORKER_IPS[$index]}")" || die "Cannot resolve GPU backend ${WORKER_IPS[$index]} for network smoke testing."
+    pod_name="pactllm-network-client-gpu-${ordinal}"
     kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -1969,8 +1930,13 @@ EOF
     -l app.kubernetes.io/name=pactllm-network-client --timeout=300s; then
     kubectl -n kube-system describe pods -l app.kubernetes.io/part-of=pactllm-network-smoke || true
     cleanup_network_smoke_pods
-    die 'A router-side DNS/TCP network smoke client failed.'
+    die 'A platform/GPU DNS/TCP network smoke client failed.'
   fi
+  client_count="$(kubectl -n kube-system get pods -l app.kubernetes.io/name=pactllm-network-client --no-headers | wc -l | tr -d '[:space:]')"
+  [[ "$client_count" == "$((GPU_WORKER_COUNT + 1))" ]] || {
+    cleanup_network_smoke_pods
+    die "Expected $((GPU_WORKER_COUNT + 1)) network smoke clients, but found $client_count."
+  }
   while IFS= read -r pod_name; do
     [[ -n "$pod_name" ]] || continue
     output="$(kubectl -n kube-system logs "$pod_name")"
@@ -1981,7 +1947,7 @@ EOF
   done < <(kubectl -n kube-system get pods -l app.kubernetes.io/name=pactllm-network-client -o name)
 
   cleanup_network_smoke_pods
-  printstyle "Cross-node DNS/TCP verification succeeded for all 2 routers x 4 GPU backends.\n\n" success
+  printstyle "Cross-node DNS/TCP verification succeeded from the platform and all ${GPU_WORKER_COUNT} GPU backends to every GPU backend.\n\n" success
 }
 
 verify_selected_pods_on_platform() {
@@ -2070,7 +2036,6 @@ INSTALL_CALICO='true'
 INSTALL_METRICS_SERVER='false'
 METRICS_SERVER_VERSION=''
 REGULAR_USER_HOME=''
-ROUTER_WORKER_COUNT=''
 GPU_WORKER_COUNT=''
 JOIN_COMMAND_BASE64=''
 INSTALL_NVIDIA_STACK='true'
@@ -2103,7 +2068,6 @@ declare -a WORKER_USERS=()
 declare -a WORKER_PASSWORDS=()
 declare -a WORKER_ROLES=()
 declare -a WORKER_HOSTNAMES=()
-declare -a ROUTER_WORKER_INDICES=()
 declare -a GPU_WORKER_INDICES=()
 declare -a LOCAL_TEMP_PATHS=()
 SSH_OPTIONS=(-o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15)
@@ -2168,11 +2132,6 @@ printstyle "Core versions: Kubernetes v${KUBERNETES_VERSION}, containerd v${CONT
 printstyle "GPU/AI versions: Toolkit v${NVIDIA_CONTAINER_TOOLKIT_VERSION}, GPU Operator v${GPU_OPERATOR_VERSION}, Dynamo v${DYNAMO_PLATFORM_VERSION}, vLLM v${DYNAMO_VLLM_VERSION}\n" info
 
 case "$NODE_ROLE" in
-  router-worker)
-    verify_worker_bootstrap_marker
-    install_node_components
-    join_worker_node
-    ;;
   gpu-backend-worker)
     verify_worker_bootstrap_marker
     install_node_components
@@ -2200,7 +2159,7 @@ case "$NODE_ROLE" in
       install_metrics_server
 
       lineprint
-      printstyle "Provisioning and joining ${ROUTER_WORKER_COUNT} router worker(s) and ${GPU_WORKER_COUNT} GPU backend worker(s) over SSH ...\n" info
+      printstyle "Provisioning and joining ${GPU_WORKER_COUNT} GPU backend worker(s) over SSH ...\n" info
       JOIN_COMMAND="$(kubeadm token create --print-join-command) --cri-socket=${CRI_SOCKET}"
       [[ -n "$JOIN_COMMAND" ]] || die 'Failed to create the worker join command.'
       for index in "${!WORKER_IPS[@]}"; do

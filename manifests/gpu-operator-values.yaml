@@ -46,8 +46,8 @@ kataSandboxDevicePlugin:
 ccManager:
   enabled: false
 
-# NFD workers remain a DaemonSet, while its controllers stay off experiment
-# router/GPU nodes.
+# NFD workers remain a DaemonSet, while its controllers stay on the platform
+# control-plane node.
 node-feature-discovery:
   master:
     nodeSelector:

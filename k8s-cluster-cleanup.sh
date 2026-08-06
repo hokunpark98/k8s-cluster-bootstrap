@@ -30,7 +30,6 @@ EXPECTED_CONTROL_PLANE_IP='192.168.0.10'
 EXPECTED_POD_CIDR='10.244.0.0/16'
 EXPECTED_REGULAR_USER_HOME='/home/dnclab'
 EXPECTED_WORKER_USER='dnclab'
-EXPECTED_ROUTER_WORKER_COUNT=2
 EXPECTED_GPU_WORKER_COUNT=4
 REMOTE_CLEANUP_DIR='/tmp/k8s-cluster-cleanup-1-35-6'
 NODE_MARKER_DIR='/etc/pactllm-bootstrap'
@@ -127,11 +126,11 @@ load_config() {
     fi
 
     case "$key" in
-      NODE_ROLE|CLUSTER_ID|KUBERNETES_VERSION|CONTAINERD_VERSION|CALICO_VERSION|HELM_VERSION|CONTROL_PLANE_IP|POD_CIDR|INSTALL_CALICO|INSTALL_METRICS_SERVER|METRICS_SERVER_VERSION|REGULAR_USER_HOME|ROUTER_WORKER_COUNT|GPU_WORKER_COUNT|INSTALL_NVIDIA_STACK|NVIDIA_DRIVER_VERSION|NVIDIA_CONTAINER_TOOLKIT_VERSION|NVIDIA_GPU_MODEL|NVIDIA_GPU_MEMORY_MIB|NVIDIA_GPU_COUNT_PER_WORKER|GPU_OPERATOR_VERSION|INSTALL_DYNAMO_PLATFORM|DYNAMO_PLATFORM_VERSION|DYNAMO_VLLM_VERSION|DYNAMO_VLLM_IMAGE|DYNAMO_NAMESPACE|DYNAMO_NATS_STORAGE_CLASS|DYNAMO_NATS_STORAGE_SIZE|DYNAMO_NATS_STORAGE_PATH|PREPULL_DYNAMO_VLLM_IMAGE|INSTALL_GATEWAY_FOUNDATION|GATEWAY_API_VERSION|GAIE_VERSION|AGENTGATEWAY_VERSION|AGENTGATEWAY_NAMESPACE)
+      NODE_ROLE|CLUSTER_ID|KUBERNETES_VERSION|CONTAINERD_VERSION|CALICO_VERSION|HELM_VERSION|CONTROL_PLANE_IP|POD_CIDR|INSTALL_CALICO|INSTALL_METRICS_SERVER|METRICS_SERVER_VERSION|REGULAR_USER_HOME|GPU_WORKER_COUNT|INSTALL_NVIDIA_STACK|NVIDIA_DRIVER_VERSION|NVIDIA_CONTAINER_TOOLKIT_VERSION|NVIDIA_GPU_MODEL|NVIDIA_GPU_MEMORY_MIB|NVIDIA_GPU_COUNT_PER_WORKER|GPU_OPERATOR_VERSION|INSTALL_DYNAMO_PLATFORM|DYNAMO_PLATFORM_VERSION|DYNAMO_VLLM_VERSION|DYNAMO_VLLM_IMAGE|DYNAMO_NAMESPACE|DYNAMO_NATS_STORAGE_CLASS|DYNAMO_NATS_STORAGE_SIZE|DYNAMO_NATS_STORAGE_PATH|PREPULL_DYNAMO_VLLM_IMAGE|INSTALL_GATEWAY_FOUNDATION|GATEWAY_API_VERSION|GAIE_VERSION|AGENTGATEWAY_VERSION|AGENTGATEWAY_NAMESPACE)
         printf -v "$key" '%s' "$value"
         ;;
       *)
-        if [[ "$key" =~ ^(ROUTER|GPU)_WORKER_[1-9][0-9]*_(IP|SSH_USER|SSH_PASSWORD)$ ]]; then
+        if [[ "$key" =~ ^GPU_WORKER_[1-4]_(IP|SSH_USER|SSH_PASSWORD)$ ]]; then
           printf -v "$key" '%s' "$value"
         else
           die "Unknown configuration key: $key"
@@ -175,55 +174,38 @@ validate_fixed_stack() {
   [[ "$CONTROL_PLANE_IP" == "$EXPECTED_CONTROL_PLANE_IP" ]] || die "Cleanup is pinned to control-plane IP $EXPECTED_CONTROL_PLANE_IP."
   [[ "$POD_CIDR" == "$EXPECTED_POD_CIDR" ]] || die "Cleanup is pinned to pod CIDR $EXPECTED_POD_CIDR."
   [[ "$REGULAR_USER_HOME" == "$EXPECTED_REGULAR_USER_HOME" ]] || die "Cleanup is pinned to regular user home $EXPECTED_REGULAR_USER_HOME."
-  [[ "$ROUTER_WORKER_COUNT" =~ ^[1-9][0-9]*$ ]] || die 'ROUTER_WORKER_COUNT must be a positive integer.'
   [[ "$GPU_WORKER_COUNT" =~ ^[1-9][0-9]*$ ]] || die 'GPU_WORKER_COUNT must be a positive integer.'
-  ROUTER_WORKER_COUNT="$((10#$ROUTER_WORKER_COUNT))"
   GPU_WORKER_COUNT="$((10#$GPU_WORKER_COUNT))"
-  (( ROUTER_WORKER_COUNT == EXPECTED_ROUTER_WORKER_COUNT )) || die "Cleanup is pinned to $EXPECTED_ROUTER_WORKER_COUNT router workers."
   (( GPU_WORKER_COUNT == EXPECTED_GPU_WORKER_COUNT )) || die "Cleanup is pinned to $EXPECTED_GPU_WORKER_COUNT GPU backend workers."
 }
 
 collect_workers() {
-  local group role count_var count index ip_var user_var password_var ip user password
+  local index ip_var user_var password_var ip user password
   declare -A seen_ips=()
 
-  for group in ROUTER GPU; do
-    if [[ "$group" == 'ROUTER' ]]; then
-      role='router'
-      count_var='ROUTER_WORKER_COUNT'
-    else
-      role='gpu-backend'
-      count_var='GPU_WORKER_COUNT'
-    fi
-    count="${!count_var}"
+  for ((index = 1; index <= GPU_WORKER_COUNT; index++)); do
+    ip_var="GPU_WORKER_${index}_IP"
+    user_var="GPU_WORKER_${index}_SSH_USER"
+    password_var="GPU_WORKER_${index}_SSH_PASSWORD"
+    require_config_value "$ip_var"
+    require_config_value "$user_var"
+    require_config_value "$password_var"
 
-    for ((index = 1; index <= count; index++)); do
-      ip_var="${group}_WORKER_${index}_IP"
-      user_var="${group}_WORKER_${index}_SSH_USER"
-      password_var="${group}_WORKER_${index}_SSH_PASSWORD"
-      require_config_value "$ip_var"
-      require_config_value "$user_var"
-      require_config_value "$password_var"
+    ip="${!ip_var}"
+    user="${!user_var}"
+    password="${!password_var}"
+    valid_ipv4 "$ip" || die "Invalid GPU backend worker IP: $ip"
+    [[ "$ip" == "192.168.0.$((10 + index))" ]] || \
+      die "GPU backend worker $index IP must be 192.168.0.$((10 + index))."
+    [[ "$ip" != "$CONTROL_PLANE_IP" ]] || die "Worker IP cannot equal the control-plane IP: $ip"
+    [[ -z "${seen_ips[$ip]:-}" ]] || die "Duplicate worker IP: $ip"
+    [[ "$user" =~ ^[a-z_][a-z0-9_-]*\$?$ ]] || die "Invalid SSH username for GPU backend worker $index: $user"
+    [[ "$user" == "$EXPECTED_WORKER_USER" ]] || die "GPU backend worker $index SSH user must be $EXPECTED_WORKER_USER."
+    seen_ips["$ip"]=1
 
-      ip="${!ip_var}"
-      user="${!user_var}"
-      password="${!password_var}"
-      valid_ipv4 "$ip" || die "Invalid ${role} worker IP: $ip"
-      if [[ "$role" == 'gpu-backend' ]]; then
-        [[ "$ip" == "192.168.0.$((10 + index))" ]] || \
-          die "GPU backend worker $index IP must be 192.168.0.$((10 + index))."
-      fi
-      [[ "$ip" != "$CONTROL_PLANE_IP" ]] || die "Worker IP cannot equal the control-plane IP: $ip"
-      [[ -z "${seen_ips[$ip]:-}" ]] || die "Duplicate worker IP: $ip"
-      [[ "$user" =~ ^[a-z_][a-z0-9_-]*\$?$ ]] || die "Invalid SSH username for ${role} worker $index: $user"
-      [[ "$user" == "$EXPECTED_WORKER_USER" ]] || die "${role} worker $index SSH user must be $EXPECTED_WORKER_USER."
-      seen_ips["$ip"]=1
-
-      WORKER_IPS+=("$ip")
-      WORKER_USERS+=("$user")
-      WORKER_PASSWORDS+=("$password")
-      WORKER_ROLES+=("$role")
-    done
+    WORKER_IPS+=("$ip")
+    WORKER_USERS+=("$user")
+    WORKER_PASSWORDS+=("$password")
   done
 }
 
@@ -265,11 +247,10 @@ set_node_cleanup_state_cleaned() {
 
 verify_remote_marker() {
   local index="$1"
-  local role ip command
+  local ip command
 
-  role="${WORKER_ROLES[$index]}"
   ip="${WORKER_IPS[$index]}"
-  command="test -f '${NODE_MARKER_FILE}' && test ! -L '${NODE_MARKER_FILE}' && test \"\$(stat -c '%u:%g:%a' '${NODE_MARKER_FILE}')\" = '0:0:600' && grep -Fxq 'CLUSTER_ID=${CLUSTER_ID}' '${NODE_MARKER_FILE}' && grep -Fxq 'NODE_ROLE=${role}' '${NODE_MARKER_FILE}' && grep -Fxq 'NODE_IP=${ip}' '${NODE_MARKER_FILE}' && grep -Fxq 'KUBERNETES_VERSION=${EXPECTED_KUBERNETES_VERSION}' '${NODE_MARKER_FILE}' && grep -Eq '^CLEANUP_STATE=(active|cleaned)$' '${NODE_MARKER_FILE}'"
+  command="test -f '${NODE_MARKER_FILE}' && test ! -L '${NODE_MARKER_FILE}' && test \"\$(stat -c '%u:%g:%a' '${NODE_MARKER_FILE}')\" = '0:0:600' && grep -Fxq 'CLUSTER_ID=${CLUSTER_ID}' '${NODE_MARKER_FILE}' && grep -Fxq 'NODE_ROLE=gpu-backend' '${NODE_MARKER_FILE}' && grep -Fxq 'NODE_IP=${ip}' '${NODE_MARKER_FILE}' && grep -Fxq 'KUBERNETES_VERSION=${EXPECTED_KUBERNETES_VERSION}' '${NODE_MARKER_FILE}' && grep -Eq '^CLEANUP_STATE=(active|cleaned)$' '${NODE_MARKER_FILE}'"
   remote_privileged_command "$index" "$command"
 }
 
@@ -330,19 +311,6 @@ verify_remote_driver() {
   (( gpu_count == EXPECTED_NVIDIA_GPU_COUNT_PER_WORKER )) || die "Worker $target does not have exactly $EXPECTED_NVIDIA_GPU_COUNT_PER_WORKER GPU."
 }
 
-verify_remote_router_driver_if_present() {
-  local index="$1"
-  local target password versions
-
-  target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
-  password="${WORKER_PASSWORDS[$index]}"
-  versions="$(SSHPASS="$password" sshpass -e ssh "${SSH_OPTIONS[@]}" "$target" \
-    "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null || true")"
-  if [[ -n "$versions" ]] && grep -Fvx "$EXPECTED_NVIDIA_DRIVER_VERSION" <<< "$versions" | grep -q .; then
-    die "Router $target has an NVIDIA driver other than $EXPECTED_NVIDIA_DRIVER_VERSION."
-  fi
-}
-
 preflight_remote_workers() {
   local index target password user hostname_short
   declare -A seen_hostnames=(["$LOCAL_HOSTNAME"]=1)
@@ -373,11 +341,7 @@ preflight_remote_workers() {
     WORKER_CLEANUP_STATES[$index]="$(remote_marker_cleanup_state "$index")"
     [[ "${WORKER_CLEANUP_STATES[$index]}" == 'active' || "${WORKER_CLEANUP_STATES[$index]}" == 'cleaned' ]] || \
       die "Remote host $target has an invalid cleanup marker state."
-    if [[ "${WORKER_ROLES[$index]}" == 'gpu-backend' ]]; then
-      verify_remote_driver "$index"
-    else
-      verify_remote_router_driver_if_present "$index"
-    fi
+    verify_remote_driver "$index"
   done
 }
 
@@ -405,7 +369,7 @@ verify_api_inventory_if_available() {
   expected_roles["$CONTROL_PLANE_IP"]='platform'
   expected_names["$CONTROL_PLANE_IP"]="$LOCAL_HOSTNAME"
   for index in "${!WORKER_IPS[@]}"; do
-    expected_roles["${WORKER_IPS[$index]}"]="${WORKER_ROLES[$index]}"
+    expected_roles["${WORKER_IPS[$index]}"]='gpu-backend'
     expected_names["${WORKER_IPS[$index]}"]="${WORKER_HOSTNAMES[$index]}"
   done
 
@@ -782,11 +746,6 @@ verify_node_cleanup() {
       gpu_count=$((gpu_count + 1))
     done <<< "$versions"
     (( gpu_count == EXPECTED_NVIDIA_GPU_COUNT_PER_WORKER )) || die 'The protected GPU backend no longer has exactly one RTX 3090.'
-  elif [[ "$node_kind" == 'router-worker' ]] && command -v nvidia-smi >/dev/null 2>&1; then
-    versions="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader)" || die 'The router NVIDIA Driver is not healthy after cleanup.'
-    if grep -Fvx "$EXPECTED_NVIDIA_DRIVER_VERSION" <<< "$versions" | grep -q .; then
-      die "Router NVIDIA Driver changed during cleanup; expected $EXPECTED_NVIDIA_DRIVER_VERSION."
-    fi
   fi
   if [[ "$node_kind" == 'control-plane' ]]; then
     [[ ! -e "$EXPECTED_DYNAMO_NATS_STORAGE_PATH" ]] || die 'Dynamo NATS storage remains on the control plane.'
@@ -871,7 +830,7 @@ cleanup_remote_worker() {
   target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
   password="${WORKER_PASSWORDS[$index]}"
   if [[ "${WORKER_CLEANUP_STATES[$index]}" == 'cleaned' ]]; then
-    printstyle "${WORKER_ROLES[$index]} worker $target was already cleaned in an earlier run; preserving its tombstone marker.\n" success
+    printstyle "GPU backend worker $target was already cleaned in an earlier run; preserving its tombstone marker.\n" success
     return 0
   fi
   lineprint
@@ -883,10 +842,10 @@ cleanup_remote_worker() {
     die "Failed to transfer the cleanup script to $target. The control plane was not reset."
   fi
 
-  remote_privileged_command "$index" "chmod 700 '${REMOTE_CLEANUP_DIR}/cleanup.sh'; CLEANUP_NODE_ROLE='${WORKER_ROLES[$index]}-worker' CLEANUP_CLUSTER_ID='${CLUSTER_ID}' CLEANUP_NODE_IP='${WORKER_IPS[$index]}' '${REMOTE_CLEANUP_DIR}/cleanup.sh'" || status=$?
+  remote_privileged_command "$index" "chmod 700 '${REMOTE_CLEANUP_DIR}/cleanup.sh'; CLEANUP_NODE_ROLE='gpu-backend-worker' CLEANUP_CLUSTER_ID='${CLUSTER_ID}' CLEANUP_NODE_IP='${WORKER_IPS[$index]}' '${REMOTE_CLEANUP_DIR}/cleanup.sh'" || status=$?
   cleanup_remote_script "$index"
   (( status == 0 )) || die "Worker cleanup failed on $target. The control plane was not reset."
-  printstyle "${WORKER_ROLES[$index]} worker $target cleanup completed; any host NVIDIA Driver was preserved.\n\n" success
+  printstyle "GPU backend worker $target cleanup completed; the NVIDIA Driver was preserved.\n\n" success
 }
 
 remove_generated_kubeconfig() {
@@ -918,7 +877,7 @@ main() {
   local index
 
   [[ "${EUID:-$(id -u)}" -eq 0 ]] || die 'Please run this cleanup script as root.'
-  if [[ "$cleanup_role" == 'router-worker' || "$cleanup_role" == 'gpu-backend-worker' ]]; then
+  if [[ "$cleanup_role" == 'gpu-backend-worker' ]]; then
     require_config_value CLEANUP_CLUSTER_ID
     require_config_value CLEANUP_NODE_IP
     valid_ipv4 "$CLEANUP_NODE_IP" || die 'Invalid internal cleanup node IP.'
@@ -951,7 +910,6 @@ main() {
   INSTALL_METRICS_SERVER=''
   METRICS_SERVER_VERSION=''
   REGULAR_USER_HOME=''
-  ROUTER_WORKER_COUNT=''
   GPU_WORKER_COUNT=''
   INSTALL_NVIDIA_STACK=''
   NVIDIA_DRIVER_VERSION=''
@@ -977,14 +935,13 @@ main() {
   declare -g -a WORKER_IPS=()
   declare -g -a WORKER_USERS=()
   declare -g -a WORKER_PASSWORDS=()
-  declare -g -a WORKER_ROLES=()
   declare -g -a WORKER_HOSTNAMES=()
   declare -g -a WORKER_CLEANUP_STATES=()
   declare -g -a SSH_OPTIONS=(-o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15)
   declare -g -a SCP_OPTIONS=(-o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
 
   load_config
-  for value_name in NODE_ROLE CLUSTER_ID KUBERNETES_VERSION CONTAINERD_VERSION CALICO_VERSION CONTROL_PLANE_IP ROUTER_WORKER_COUNT GPU_WORKER_COUNT METRICS_SERVER_VERSION NVIDIA_DRIVER_VERSION NVIDIA_CONTAINER_TOOLKIT_VERSION NVIDIA_GPU_MEMORY_MIB GPU_OPERATOR_VERSION DYNAMO_PLATFORM_VERSION DYNAMO_NAMESPACE DYNAMO_NATS_STORAGE_CLASS DYNAMO_NATS_STORAGE_SIZE DYNAMO_NATS_STORAGE_PATH GATEWAY_API_VERSION GAIE_VERSION AGENTGATEWAY_VERSION AGENTGATEWAY_NAMESPACE; do
+  for value_name in NODE_ROLE CLUSTER_ID KUBERNETES_VERSION CONTAINERD_VERSION CALICO_VERSION CONTROL_PLANE_IP GPU_WORKER_COUNT METRICS_SERVER_VERSION NVIDIA_DRIVER_VERSION NVIDIA_CONTAINER_TOOLKIT_VERSION NVIDIA_GPU_MEMORY_MIB GPU_OPERATOR_VERSION DYNAMO_PLATFORM_VERSION DYNAMO_NAMESPACE DYNAMO_NATS_STORAGE_CLASS DYNAMO_NATS_STORAGE_SIZE DYNAMO_NATS_STORAGE_PATH GATEWAY_API_VERSION GAIE_VERSION AGENTGATEWAY_VERSION AGENTGATEWAY_NAMESPACE; do
     require_config_value "$value_name"
   done
   validate_fixed_stack
@@ -1027,8 +984,8 @@ main() {
 
   lineprint
   printstyle 'Cluster cleanup completed successfully.\n' success
-  printstyle "Safety tombstones were retained in ${NODE_MARKER_FILE} on all seven nodes so an interrupted cleanup remains auditable and rerunnable.\n" success
-  printstyle "Preserved component: NVIDIA Driver ${EXPECTED_NVIDIA_DRIVER_VERSION} on all GPU backends and on routers where it was installed.\n" success
+  printstyle "Safety tombstones were retained in ${NODE_MARKER_FILE} on all five nodes so an interrupted cleanup remains auditable and rerunnable.\n" success
+  printstyle "Preserved component: NVIDIA Driver ${EXPECTED_NVIDIA_DRIVER_VERSION} on all four GPU backends.\n" success
   printstyle 'Not restored automatically: swap configuration and UFW state.\n' warning
   printstyle 'Reboot each worker, then reboot the control plane manually. After reboot, verify nvidia-smi on every GPU backend.\n' warning
 }
