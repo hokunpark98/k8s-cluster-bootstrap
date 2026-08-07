@@ -31,8 +31,10 @@ EXPECTED_POD_CIDR='10.244.0.0/16'
 EXPECTED_REGULAR_USER_HOME='/home/dnclab'
 EXPECTED_WORKER_USER='dnclab'
 EXPECTED_GPU_WORKER_COUNT=4
+MAX_PARALLEL_WORKER_CLEANUPS=4
 REMOTE_CLEANUP_DIR='/tmp/k8s-cluster-cleanup-1-35-6'
 BOOTSTRAP_STATE_ROOT='/var/lib/prrw-bootstrap'
+CLEANUP_LOG_DIR="${BOOTSTRAP_STATE_ROOT}/cleanup-worker-logs"
 BOOTSTRAP_MARKER_SEARCH_ROOT='/etc'
 BOOTSTRAP_STATE_SEARCH_ROOT='/var/lib'
 BOOTSTRAP_MARKER_OWNER_UID=0
@@ -254,6 +256,23 @@ remote_privileged_command() {
     SSHPASS="$password" sshpass -e ssh "${SSH_OPTIONS[@]}" "$target" "bash -c $quoted_command"
   else
     printf '%s\n' "$password" | SSHPASS="$password" sshpass -e ssh "${SSH_OPTIONS[@]}" "$target" "sudo -S -p '' bash -c $quoted_command"
+  fi
+}
+
+remote_cleanup_privileged_command() {
+  local index="$1"
+  local command="$2"
+  local target password user quoted_command
+
+  target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
+  password="${WORKER_PASSWORDS[$index]}"
+  user="${WORKER_USERS[$index]}"
+  printf -v quoted_command '%q' "$command"
+
+  if [[ "$user" == 'root' ]]; then
+    SSHPASS="$password" sshpass -e ssh "${PARALLEL_SSH_OPTIONS[@]}" "$target" "bash -c $quoted_command"
+  else
+    printf '%s\n' "$password" | SSHPASS="$password" sshpass -e ssh "${PARALLEL_SSH_OPTIONS[@]}" "$target" "sudo -S -p '' bash -c $quoted_command"
   fi
 }
 
@@ -788,28 +807,182 @@ cleanup_remote_script() {
 
   target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
   password="${WORKER_PASSWORDS[$index]}"
-  SSHPASS="$password" sshpass -e ssh "${SSH_OPTIONS[@]}" "$target" "rm -f -- '${REMOTE_CLEANUP_DIR}/cleanup.sh'; rmdir -- '${REMOTE_CLEANUP_DIR}' 2>/dev/null || true" >/dev/null 2>&1 || true
+  SSHPASS="$password" sshpass -e ssh "${PARALLEL_SSH_OPTIONS[@]}" "$target" "rm -f -- '${REMOTE_CLEANUP_DIR}/cleanup.sh'; rmdir -- '${REMOTE_CLEANUP_DIR}' 2>/dev/null || true" >/dev/null 2>&1 || true
 }
 
 cleanup_remote_worker() {
   local index="$1"
-  local target password status=0
+  local target password status=0 worker_label
 
   target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
   password="${WORKER_PASSWORDS[$index]}"
+  worker_label="GPU backend worker $((index + 1)) (${WORKER_IPS[$index]})"
   lineprint
-  printstyle "Cleaning worker $target ...\n" info
+  printstyle "Cleaning ${worker_label} ...\n" info
 
-  if ! SSHPASS="$password" sshpass -e ssh "${SSH_OPTIONS[@]}" "$target" "umask 077; mkdir -p '${REMOTE_CLEANUP_DIR}'" || \
-     ! SSHPASS="$password" sshpass -e scp "${SCP_OPTIONS[@]}" "$SCRIPT_PATH" "$target:${REMOTE_CLEANUP_DIR}/cleanup.sh"; then
+  if ! SSHPASS="$password" sshpass -e ssh "${PARALLEL_SSH_OPTIONS[@]}" "$target" "umask 077; mkdir -p '${REMOTE_CLEANUP_DIR}'" || \
+     ! SSHPASS="$password" sshpass -e scp "${PARALLEL_SCP_OPTIONS[@]}" "$SCRIPT_PATH" "$target:${REMOTE_CLEANUP_DIR}/cleanup.sh"; then
     cleanup_remote_script "$index"
-    die "Failed to transfer the cleanup script to $target. The control plane was not reset."
+    die "Failed to transfer the cleanup script to ${worker_label}. The control plane was not reset."
   fi
 
-  remote_privileged_command "$index" "chmod 700 '${REMOTE_CLEANUP_DIR}/cleanup.sh'; CLEANUP_NODE_ROLE='gpu-backend-worker' CLEANUP_NODE_IP='${WORKER_IPS[$index]}' '${REMOTE_CLEANUP_DIR}/cleanup.sh'" || status=$?
+  remote_cleanup_privileged_command "$index" "chmod 700 '${REMOTE_CLEANUP_DIR}/cleanup.sh'; CLEANUP_NODE_ROLE='gpu-backend-worker' CLEANUP_NODE_IP='${WORKER_IPS[$index]}' '${REMOTE_CLEANUP_DIR}/cleanup.sh'" || status=$?
   cleanup_remote_script "$index"
-  (( status == 0 )) || die "Worker cleanup failed on $target. The control plane was not reset."
-  printstyle "GPU backend worker $target cleanup completed; the NVIDIA Driver was preserved.\n\n" success
+  (( status == 0 )) || die "Cleanup failed on ${worker_label}. The control plane was not reset."
+  printstyle "${worker_label} cleanup completed; the NVIDIA Driver was preserved.\n\n" success
+}
+
+launch_remote_cleanup_job() {
+  local index="$1"
+  local log_file="$2"
+  local launch_status child_status
+
+  PARALLEL_LAUNCHED_PID=''
+  # Recheck the dynamically scoped parent signal flag immediately before the
+  # async boundary, narrowing the check/launch race in the outer loop.
+  case "${parallel_cleanup_signal:-}" in
+    INT) return 130 ;;
+    TERM) return 143 ;;
+  esac
+  (
+    set -Eeuo pipefail
+    trap 'cleanup_remote_script "$index"' EXIT
+    child_status=0
+    cleanup_remote_worker "$index" || child_status=$?
+    (( child_status == 0 )) || exit "$child_status"
+    exit 0
+  ) >"$log_file" 2>&1 &
+  launch_status=$?
+  if (( launch_status != 0 )); then
+    PARALLEL_LAUNCHED_PID=''
+    return "$launch_status"
+  fi
+  PARALLEL_LAUNCHED_PID="$!"
+  [[ "$PARALLEL_LAUNCHED_PID" =~ ^[1-9][0-9]*$ ]] || return 125
+}
+
+cleanup_remote_workers_parallel() {
+  local index status log_file worker_label pid launch_status
+  local failure_count=0
+  local parallel_cleanup_signal=''
+  local launch_failure=''
+  local -a worker_pids=()
+  local -a worker_logs=()
+  local -a worker_statuses=()
+
+  (( ${#WORKER_IPS[@]} == EXPECTED_GPU_WORKER_COUNT )) || \
+    die "Parallel cleanup requires exactly $EXPECTED_GPU_WORKER_COUNT configured GPU backend workers."
+  (( ${#WORKER_IPS[@]} <= MAX_PARALLEL_WORKER_CLEANUPS )) || \
+    die "Configured worker count exceeds the cleanup concurrency limit of $MAX_PARALLEL_WORKER_CLEANUPS."
+
+  # Once destructive worker cleanup starts, INT/TERM is remembered rather
+  # than allowed to fall through to control-plane cleanup. All launched jobs
+  # are still reaped, reported, and the parent exits without touching itself.
+  trap 'parallel_cleanup_signal=INT; warn "Interrupt received; waiting for worker cleanup jobs before refusing control-plane cleanup."' INT
+  trap 'parallel_cleanup_signal=TERM; warn "Termination requested; waiting for worker cleanup jobs before refusing control-plane cleanup."' TERM
+
+  if ! install -d -o root -g root -m 0700 "$CLEANUP_LOG_DIR"; then
+    trap - INT TERM
+    die "Failed to create root-only worker cleanup log directory: $CLEANUP_LOG_DIR"
+  fi
+  printstyle "Cleaning all ${#WORKER_IPS[@]} GPU backend workers concurrently (maximum ${MAX_PARALLEL_WORKER_CLEANUPS}) ...\n" info
+
+  # Prepare every protected log before starting any destructive remote job.
+  # A local storage/permission failure therefore cannot produce untracked
+  # worker cleanup.
+  for index in "${!WORKER_IPS[@]}"; do
+    log_file="${CLEANUP_LOG_DIR}/gpu-worker-$((index + 1))-${WORKER_IPS[$index]}.log"
+    if ! install -o root -g root -m 0600 /dev/null "$log_file"; then
+      trap - INT TERM
+      die "Failed to create root-only cleanup log for GPU backend worker $((index + 1)): $log_file"
+    fi
+    worker_logs[$index]="$log_file"
+  done
+
+  if [[ -n "$parallel_cleanup_signal" ]]; then
+    trap - INT TERM
+    die "Worker cleanup was interrupted by ${parallel_cleanup_signal} before any remote worker job started. The control plane was not reset."
+  fi
+
+  for index in "${!WORKER_IPS[@]}"; do
+    # Do not begin another destructive worker cleanup after a trapped signal.
+    # Jobs already launched are left running and are collected below.
+    [[ -z "$parallel_cleanup_signal" ]] || break
+    log_file="${worker_logs[$index]}"
+    # Each cleanup runs in its own strict subshell and log. The EXIT trap makes
+    # the remote temporary script best-effort self-cleaning even on an
+    # unexpected local/SSH failure. Passwords remain in SSHPASS/stdin and are
+    # never logged. The async launch status and PID are both checked.
+    PARALLEL_LAUNCHED_PID=''
+    if launch_remote_cleanup_job "$index" "$log_file"; then
+      launch_status=0
+    else
+      launch_status=$?
+    fi
+    pid="$PARALLEL_LAUNCHED_PID"
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+      worker_pids[$index]="$pid"
+    fi
+    if (( launch_status != 0 )) || [[ ! "$pid" =~ ^[1-9][0-9]*$ ]]; then
+      launch_failure="Failed to start cleanup for GPU backend worker $((index + 1)) (${WORKER_IPS[$index]}); launch status ${launch_status}, PID ${pid:-unavailable}."
+      warn "$launch_failure No additional worker cleanup jobs will be started."
+      break
+    fi
+    printstyle "Started GPU backend worker $((index + 1)) (${WORKER_IPS[$index]}), log: ${log_file}\n" info
+  done
+
+  # A wait used as an if-condition is safe with set -e. Always collect every
+  # job before deciding whether the control plane may be cleaned.
+  for index in "${!worker_pids[@]}"; do
+    pid="${worker_pids[$index]}"
+    while :; do
+      if wait "$pid"; then
+        status=0
+        break
+      else
+        status=$?
+      fi
+      # wait itself returns >128 when interrupted by a trapped signal. If the
+      # worker is still running, wait again rather than misreporting/reaping it
+      # incompletely. A worker that actually exited nonzero is recorded below.
+      if [[ -n "$parallel_cleanup_signal" ]] && kill -0 "$pid" 2>/dev/null; then
+        continue
+      fi
+      break
+    done
+    worker_statuses[$index]="$status"
+  done
+
+  for index in "${!WORKER_IPS[@]}"; do
+    worker_label="GPU backend worker $((index + 1)) (${WORKER_IPS[$index]})"
+    if [[ -z "${worker_pids[$index]+started}" ]]; then
+      warn "${worker_label} cleanup was not started."
+      continue
+    fi
+    status="${worker_statuses[$index]}"
+    log_file="${worker_logs[$index]}"
+    if (( status == 0 )); then
+      printstyle "${worker_label} cleanup succeeded.\n" success
+      continue
+    fi
+
+    failure_count=$((failure_count + 1))
+    printstyle "${worker_label} cleanup failed with status ${status}. Log: ${log_file}\n" danger
+    printstyle "Last 60 log lines for ${worker_label}:\n" danger
+    tail -n 60 -- "$log_file" >&2 || true
+  done
+
+  trap - INT TERM
+  if [[ -n "$parallel_cleanup_signal" ]]; then
+    die "Worker cleanup was interrupted by ${parallel_cleanup_signal}. All launched worker jobs were collected; the control plane was not reset. Review the worker logs and rerun this cleanup."
+  fi
+  if [[ -n "$launch_failure" ]]; then
+    die "${launch_failure} All previously launched worker jobs were collected; the control plane was not reset. Review the worker logs and rerun this cleanup."
+  fi
+  if (( failure_count > 0 )); then
+    die "${failure_count} worker cleanup job(s) failed. All worker jobs finished; the control plane was not reset. Correct the reported worker failures and rerun this cleanup."
+  fi
+  printstyle 'All concurrent worker cleanup jobs succeeded.\n\n' success
 }
 
 remove_generated_kubeconfig() {
@@ -891,7 +1064,6 @@ rewrite_config_for_fresh_bootstrap() {
 
 main() {
   local cleanup_role="${CLEANUP_NODE_ROLE:-control-plane}"
-  local index
 
   [[ "${EUID:-$(id -u)}" -eq 0 ]] || die 'Please run this cleanup script as root.'
   if [[ "$cleanup_role" == 'gpu-backend-worker' ]]; then
@@ -946,6 +1118,10 @@ main() {
   declare -g -a WORKER_PASSWORDS=()
   declare -g -a SSH_OPTIONS=(-o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15)
   declare -g -a SCP_OPTIONS=(-o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+  # Serial preflight above all destructive work records every host key. Worker
+  # cleanup then uses strict, read-only known_hosts access from parallel jobs.
+  declare -g -a PARALLEL_SSH_OPTIONS=(-o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o ServerAliveInterval=15)
+  declare -g -a PARALLEL_SCP_OPTIONS=(-o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" -o StrictHostKeyChecking=yes -o ConnectTimeout=15)
 
   load_config
   for value_name in NODE_ROLE KUBERNETES_VERSION CONTAINERD_VERSION CALICO_VERSION CONTROL_PLANE_IP GPU_WORKER_COUNT METRICS_SERVER_VERSION NVIDIA_DRIVER_VERSION NVIDIA_CONTAINER_TOOLKIT_VERSION NVIDIA_GPU_MEMORY_MIB GPU_OPERATOR_VERSION DYNAMO_PLATFORM_VERSION DYNAMO_NAMESPACE DYNAMO_NATS_STORAGE_CLASS DYNAMO_NATS_STORAGE_SIZE DYNAMO_NATS_STORAGE_PATH GATEWAY_API_VERSION GAIE_VERSION AGENTGATEWAY_VERSION AGENTGATEWAY_NAMESPACE; do
@@ -967,9 +1143,7 @@ main() {
   confirm_destruction
 
   cleanup_cluster_resources
-  for index in "${!WORKER_IPS[@]}"; do
-    cleanup_remote_worker "$index"
-  done
+  cleanup_remote_workers_parallel
 
   lineprint
   printstyle 'All workers are clean. Cleaning the control plane last ...\n' info

@@ -1290,7 +1290,7 @@ verify_resumable_control_plane() {
 }
 
 reconcile_workers() {
-  local join_command index node_name deadline reset_command
+  local join_command index node_name deadline
   local -a missing_indices=()
 
   for index in "${!WORKER_IPS[@]}"; do
@@ -1321,11 +1321,26 @@ reconcile_workers() {
     if node_name="$(node_name_for_ip "${WORKER_IPS[$index]}" 2>/dev/null)"; then
       kubectl delete node "$node_name" --wait=true --timeout=120s || die "Failed to remove stale Node object $node_name."
     fi
-    reset_command="$(build_partial_node_reset_command gpu-backend-worker)"
-    remote_privileged_command "$index" "$reset_command" || \
-      die "Failed to reset the partial worker ${WORKER_IPS[$index]}."
-    install_remote_worker "$index" "$join_command"
   done
+  printstyle "Resetting and reinstalling ${#missing_indices[@]} incomplete worker(s) in parallel ...\n" info
+  run_parallel_worker_jobs \
+    'worker-resume' "$MAX_PARALLEL_WORKER_INSTALLS" reset_and_install_remote_worker "$join_command" \
+    "${missing_indices[@]}"
+}
+
+reset_and_install_remote_worker() {
+  local index="$1"
+  local join_command="$2"
+  local reset_command target
+
+  target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
+  printstyle "Resetting partial Kubernetes state on $target ...\n" info
+  reset_command="$(build_partial_node_reset_command gpu-backend-worker)"
+  if ! remote_privileged_command "$index" "$reset_command"; then
+    printstyle "Failed to reset partial Kubernetes state on $target.\n" danger
+    return 1
+  fi
+  install_remote_worker "$index" "$join_command"
 }
 
 resume_cluster_bootstrap() {
@@ -1391,20 +1406,30 @@ resume_cluster_bootstrap() {
 }
 
 prepull_dynamo_vllm_runtime() {
-  local index target pull_command
-
   if [[ "$INSTALL_DYNAMO_PLATFORM" != 'true' || "$PREPULL_DYNAMO_VLLM_IMAGE" != 'true' ]]; then
     return 0
   fi
   lineprint
   printstyle "Pre-pulling Dynamo vLLM runtime image on every GPU worker: ${DYNAMO_VLLM_IMAGE} ...\n" info
-  for index in "${GPU_WORKER_INDICES[@]}"; do
-    target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
-    printstyle "Pulling runtime image on $target ...\n" info
-    pull_command="/usr/local/bin/ctr --namespace k8s.io images pull '${DYNAMO_VLLM_IMAGE}' && /usr/local/bin/ctr --namespace k8s.io images list -q | grep -Fx '${DYNAMO_VLLM_IMAGE}'"
-    remote_privileged_command "$index" "$pull_command" >/dev/null || die "Failed to pre-pull ${DYNAMO_VLLM_IMAGE} on $target."
-  done
+  run_parallel_worker_jobs \
+    'vllm-prepull' "$MAX_PARALLEL_VLLM_PREPULLS" prepull_dynamo_vllm_runtime_worker '' \
+    "${GPU_WORKER_INDICES[@]}"
   printstyle "Dynamo vLLM runtime image is present on all ${GPU_WORKER_COUNT} GPU workers (bundled vLLM ${DYNAMO_VLLM_VERSION}).\n\n" success
+}
+
+prepull_dynamo_vllm_runtime_worker() {
+  local index="$1"
+  local _unused_shared_argument="${2:-}"
+  local target pull_command
+
+  target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
+  printstyle "Pulling runtime image on $target ...\n" info
+  pull_command="/usr/local/bin/ctr --namespace k8s.io images pull '${DYNAMO_VLLM_IMAGE}' && /usr/local/bin/ctr --namespace k8s.io images list -q | grep -Fx '${DYNAMO_VLLM_IMAGE}'"
+  if ! remote_privileged_command "$index" "$pull_command"; then
+    printstyle "Failed to pre-pull ${DYNAMO_VLLM_IMAGE} on $target.\n" danger
+    return 1
+  fi
+  printstyle "Runtime image is present on $target.\n" success
 }
 
 cleanup_gpu_smoke_pods() {
@@ -1631,16 +1656,242 @@ remote_privileged_command() {
   local index="$1"
   local command="$2"
   local target password user quoted_command
+  local -a active_ssh_options
 
   target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
   password="${WORKER_PASSWORDS[$index]}"
   user="${WORKER_USERS[$index]}"
   printf -v quoted_command '%q' "$command"
+  if [[ "${PARALLEL_REMOTE_IO:-false}" == 'true' ]]; then
+    active_ssh_options=("${PARALLEL_SSH_OPTIONS[@]}")
+  else
+    active_ssh_options=("${SSH_OPTIONS[@]}")
+  fi
 
   if [[ "$user" == 'root' ]]; then
-    SSHPASS="$password" sshpass -e ssh "${SSH_OPTIONS[@]}" "$target" "bash -c $quoted_command"
+    SSHPASS="$password" sshpass -e ssh "${active_ssh_options[@]}" "$target" "bash -c $quoted_command"
   else
-    printf '%s\n' "$password" | SSHPASS="$password" sshpass -e ssh "${SSH_OPTIONS[@]}" "$target" "sudo -S -p '' bash -c $quoted_command"
+    printf '%s\n' "$password" | SSHPASS="$password" sshpass -e ssh "${active_ssh_options[@]}" "$target" "sudo -S -p '' bash -c $quoted_command"
+  fi
+}
+
+ensure_parallel_run_log_dir() {
+  local timestamp
+
+  if [[ -n "$PARALLEL_RUN_LOG_DIR" ]]; then
+    [[ -d "$PARALLEL_RUN_LOG_DIR" ]] || die "Parallel worker log directory disappeared: $PARALLEL_RUN_LOG_DIR"
+    return 0
+  fi
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  PARALLEL_RUN_LOG_DIR="${PARALLEL_LOG_ROOT}/${timestamp}-${BOOTSTRAP_MODE}-$$"
+  install -d -o root -g root -m 0700 "$PARALLEL_LOG_ROOT" "$PARALLEL_RUN_LOG_DIR"
+}
+
+wait_for_parallel_worker_batch() {
+  local active_name="$1"
+  local pid_index_name="$2"
+  local worker_status_name="$3"
+  local status=0 pid index
+  local -n active_pids_ref="$active_name"
+  local -n pid_index_ref="$pid_index_name"
+  local -n worker_status_ref="$worker_status_name"
+
+  for pid in "${active_pids_ref[@]}"; do
+    if [[ -z "${pid_index_ref[$pid]+present}" ]]; then
+      die "Could not associate background worker PID $pid with a configured worker."
+    fi
+    index="${pid_index_ref[$pid]}"
+    if wait "$pid"; then
+      status=0
+    else
+      status=$?
+    fi
+    worker_status_ref["$index"]="$status"
+  done
+  active_pids_ref=()
+  ACTIVE_PARALLEL_PIDS=()
+}
+
+cleanup_parallel_secret_files() {
+  if [[ -n "${PARALLEL_RUN_LOG_DIR:-}" && -d "$PARALLEL_RUN_LOG_DIR" ]]; then
+    find "$PARALLEL_RUN_LOG_DIR" -maxdepth 1 -type f -name '.worker-*-config.*' -delete 2>/dev/null || true
+  fi
+}
+
+freeze_parallel_process_tree() {
+  local root_pid="$1"
+  local current_pid child_pid existing_pid cursor=0 known
+  local -a process_tree=("$root_pid")
+
+  # Freeze each parent before walking its children. Once a process is stopped,
+  # it cannot fork another sshpass/ssh/scp descendant behind the traversal.
+  kill -STOP "$root_pid" 2>/dev/null || return 0
+  while (( cursor < ${#process_tree[@]} )); do
+    current_pid="${process_tree[$cursor]}"
+    cursor=$((cursor + 1))
+    while IFS= read -r child_pid; do
+      child_pid="${child_pid//[[:space:]]/}"
+      [[ "$child_pid" =~ ^[1-9][0-9]*$ ]] || continue
+      known='false'
+      for existing_pid in "${process_tree[@]}"; do
+        if [[ "$existing_pid" == "$child_pid" ]]; then
+          known='true'
+          break
+        fi
+      done
+      [[ "$known" == 'true' ]] && continue
+      if kill -STOP "$child_pid" 2>/dev/null; then
+        process_tree+=("$child_pid")
+      fi
+    done < <(ps -o pid= --ppid "${process_tree[$((cursor - 1))]}" 2>/dev/null || true)
+  done
+  printf '%s\n' "${process_tree[@]}"
+}
+
+stop_active_parallel_worker_jobs() {
+  local pid known_pid tree_pid duplicate index
+  local -a roots=("${ACTIVE_PARALLEL_PIDS[@]}")
+  local -a process_tree=()
+  local -a frozen_tree=()
+
+  # Include a just-launched child from the narrow interval before its PID is
+  # copied into ACTIVE_PARALLEL_PIDS.
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    duplicate='false'
+    for known_pid in "${roots[@]}"; do
+      if [[ "$known_pid" == "$pid" ]]; then
+        duplicate='true'
+        break
+      fi
+    done
+    [[ "$duplicate" == 'true' ]] || roots+=("$pid")
+  done < <(jobs -pr)
+
+  for pid in "${roots[@]}"; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    mapfile -t frozen_tree < <(freeze_parallel_process_tree "$pid")
+    for known_pid in "${frozen_tree[@]}"; do
+      duplicate='false'
+      for tree_pid in "${process_tree[@]}"; do
+        if [[ "$tree_pid" == "$known_pid" ]]; then
+          duplicate='true'
+          break
+        fi
+      done
+      [[ "$duplicate" == 'true' ]] || process_tree+=("$known_pid")
+    done
+  done
+
+  # Kill leaves before their stopped parents. This prevents ssh descendants
+  # from surviving as orphans when the local orchestration shell is aborted.
+  for ((index = ${#process_tree[@]} - 1; index >= 0; index--)); do
+    kill -KILL "${process_tree[$index]}" 2>/dev/null || true
+  done
+  for pid in "${roots[@]}"; do
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  ACTIVE_PARALLEL_PIDS=()
+}
+
+abort_parallel_worker_jobs() {
+  local signal="$1"
+
+  trap - INT TERM
+  stop_active_parallel_worker_jobs
+  cleanup_parallel_secret_files
+  printstyle "Bootstrap interrupted by $signal; active local worker jobs were stopped. Remote hosts may require --resume reconciliation.\n" danger
+  if [[ "$signal" == 'INT' ]]; then
+    exit 130
+  fi
+  exit 143
+}
+
+run_parallel_worker_jobs() {
+  local stage="$1"
+  local max_concurrency="$2"
+  local job_function="$3"
+  local shared_argument="$4"
+  shift 4
+  local -a indices=("$@")
+  local -a active_pids=()
+  local -A pid_index=()
+  local -A worker_status=()
+  local -A worker_logs=()
+  local index pid log_file target status launch_status failure_count=0
+
+  (( ${#indices[@]} > 0 )) || return 0
+  [[ "$max_concurrency" =~ ^[1-9][0-9]*$ ]] || die "Invalid parallel worker concurrency: $max_concurrency"
+  ensure_parallel_run_log_dir
+
+  # Prepare every log before starting any background process. A local storage
+  # failure must never leave an untracked, still-running remote worker job.
+  for index in "${indices[@]}"; do
+    log_file="${PARALLEL_RUN_LOG_DIR}/${stage}-worker-$((index + 1))-${WORKER_IPS[$index]//./-}.log"
+    if ! { : > "$log_file" && chmod 0600 "$log_file"; }; then
+      die "Cannot prepare the parallel worker log: $log_file"
+    fi
+    worker_logs["$index"]="$log_file"
+  done
+
+  for index in "${indices[@]}"; do
+    target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
+    log_file="${worker_logs[$index]}"
+    printstyle "Starting ${stage} on $target (log: $log_file) ...\n" info
+    pid=''
+    launch_status=0
+    set +e
+    (
+      trap - EXIT INT TERM
+      set -Eeuo pipefail
+      PARALLEL_REMOTE_IO='true'
+      "$job_function" "$index" "$shared_argument"
+    ) > "$log_file" 2>&1 &
+    launch_status=$?
+    if (( launch_status == 0 )); then
+      pid=$!
+    fi
+    set -e
+    if (( launch_status != 0 )) || [[ ! "$pid" =~ ^[1-9][0-9]*$ ]]; then
+      stop_active_parallel_worker_jobs
+      cleanup_parallel_secret_files
+      die "Failed to launch ${stage} for $target; previously launched worker jobs were stopped and reaped."
+    fi
+    active_pids+=("$pid")
+    pid_index["$pid"]="$index"
+    ACTIVE_PARALLEL_PIDS=("${active_pids[@]}")
+
+    if (( ${#active_pids[@]} >= max_concurrency )); then
+      wait_for_parallel_worker_batch active_pids pid_index worker_status
+    fi
+  done
+  if (( ${#active_pids[@]} > 0 )); then
+    wait_for_parallel_worker_batch active_pids pid_index worker_status
+  fi
+  cleanup_parallel_secret_files
+
+  lineprint
+  printstyle "Parallel ${stage} summary:\n" info
+  for index in "${indices[@]}"; do
+    target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
+    log_file="${worker_logs[$index]}"
+    status="${worker_status[$index]:-missing}"
+    if [[ "$status" == '0' ]]; then
+      printstyle "  SUCCESS  $target  log=$log_file\n" success
+      continue
+    fi
+    failure_count=$((failure_count + 1))
+    printstyle "  FAILED   $target  status=$status  log=$log_file\n" danger
+    printstyle "  Last ${PARALLEL_FAILURE_TAIL_LINES} log lines for $target:\n" warning
+    while IFS= read -r line; do
+      printf '    %s\n' "$line" >&2
+    done < <(tail -n "$PARALLEL_FAILURE_TAIL_LINES" "$log_file" 2>/dev/null || true)
+  done
+  lineprint
+  if (( failure_count > 0 )); then
+    die "Parallel ${stage} failed on ${failure_count}/${#indices[@]} worker(s). Subsequent stages were not started."
   fi
 }
 
@@ -1654,15 +1905,29 @@ install_remote_worker() {
   local index="$1"
   local join_command="$2"
   local target password remote_dir local_config join_base64 remote_command status worker_role
+  local -a active_ssh_options active_scp_options
 
   target="${WORKER_USERS[$index]}@${WORKER_IPS[$index]}"
   password="${WORKER_PASSWORDS[$index]}"
   remote_dir="/tmp/k8s-cluster-bootstrap-${KUBERNETES_VERSION//./-}"
-  local_config="$(mktemp)"
-  LOCAL_TEMP_PATHS+=("$local_config")
-  join_base64="$(printf '%s' "$join_command" | base64 -w0)"
   worker_role="${WORKER_ROLES[$index]}"
-  [[ "$worker_role" == 'gpu-backend' ]] || die "Unexpected worker role for ${WORKER_IPS[$index]}: $worker_role"
+  if [[ "$worker_role" != 'gpu-backend' ]]; then
+    printstyle "Unexpected worker role for ${WORKER_IPS[$index]}: $worker_role\n" danger
+    return 1
+  fi
+  if [[ -z "$PARALLEL_RUN_LOG_DIR" || ! -d "$PARALLEL_RUN_LOG_DIR" ]]; then
+    printstyle 'Parallel worker state directory is not initialized.\n' danger
+    return 1
+  fi
+  local_config="$(mktemp "${PARALLEL_RUN_LOG_DIR}/.worker-$((index + 1))-config.XXXXXX")"
+  join_base64="$(printf '%s' "$join_command" | base64 -w0)"
+  if [[ "${PARALLEL_REMOTE_IO:-false}" == 'true' ]]; then
+    active_ssh_options=("${PARALLEL_SSH_OPTIONS[@]}")
+    active_scp_options=("${PARALLEL_SCP_OPTIONS[@]}")
+  else
+    active_ssh_options=("${SSH_OPTIONS[@]}")
+    active_scp_options=("${SCP_OPTIONS[@]}")
+  fi
 
   {
     printf 'NODE_ROLE=%s-worker\n' "$worker_role"
@@ -1705,18 +1970,24 @@ install_remote_worker() {
 
   lineprint
   printstyle "Installing and joining ${worker_role} worker $target ...\n" info
-  if ! SSHPASS="$password" sshpass -e ssh "${SSH_OPTIONS[@]}" "$target" "umask 077; mkdir -p '$remote_dir'" || \
-     ! SSHPASS="$password" sshpass -e scp "${SCP_OPTIONS[@]}" "$SCRIPT_PATH" "$target:$remote_dir/bootstrap.sh" || \
-     ! SSHPASS="$password" sshpass -e scp "${SCP_OPTIONS[@]}" "$local_config" "$target:$remote_dir/worker.env"; then
+  if ! SSHPASS="$password" sshpass -e ssh "${active_ssh_options[@]}" "$target" "umask 077; mkdir -p '$remote_dir'" || \
+     ! SSHPASS="$password" sshpass -e scp "${active_scp_options[@]}" "$SCRIPT_PATH" "$target:$remote_dir/bootstrap.sh" || \
+     ! SSHPASS="$password" sshpass -e scp "${active_scp_options[@]}" "$local_config" "$target:$remote_dir/worker.env"; then
     cleanup_remote_worker_files "$index" "$remote_dir"
-    die "Failed to transfer bootstrap files to $target."
+    rm -f -- "$local_config"
+    printstyle "Failed to transfer bootstrap files to $target.\n" danger
+    return 1
   fi
 
   remote_command="chmod 700 '${remote_dir}/bootstrap.sh'; chmod 600 '${remote_dir}/worker.env'; env CONFIG_FILE='${remote_dir}/worker.env' '${remote_dir}/bootstrap.sh'"
   status=0
   remote_privileged_command "$index" "$remote_command" || status=$?
   cleanup_remote_worker_files "$index" "$remote_dir"
-  (( status == 0 )) || die "Worker installation failed on $target."
+  rm -f -- "$local_config"
+  if (( status != 0 )); then
+    printstyle "Worker installation failed on $target.\n" danger
+    return "$status"
+  fi
   printstyle "Worker $target joined successfully.\n\n" success
 }
 
@@ -2015,6 +2286,7 @@ cleanup_local_temp_paths() {
       rm -f -- "$path"
     fi
   done
+  cleanup_parallel_secret_files
 }
 
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
@@ -2042,13 +2314,19 @@ CRI_SOCKET='unix:///run/containerd/containerd.sock'
 SANDBOX_IMAGE='registry.k8s.io/pause:3.10.1'
 NETWORK_SMOKE_IMAGE='docker.io/library/busybox:1.37.0'
 NVIDIA_SMI_GPU_NAME='NVIDIA GeForce RTX 3090'
-HELM_STATE_ROOT='/var/lib/prrw-bootstrap/helm'
+PRRW_BOOTSTRAP_STATE_ROOT='/var/lib/prrw-bootstrap'
+HELM_STATE_ROOT="${PRRW_BOOTSTRAP_STATE_ROOT}/helm"
 HELM_CONFIG_HOME="${HELM_STATE_ROOT}/config"
 HELM_CACHE_HOME="${HELM_STATE_ROOT}/cache"
 HELM_DATA_HOME="${HELM_STATE_ROOT}/data"
 export HELM_CONFIG_HOME HELM_CACHE_HOME HELM_DATA_HOME
-SSH_STATE_DIR='/var/lib/prrw-bootstrap/ssh'
+SSH_STATE_DIR="${PRRW_BOOTSTRAP_STATE_ROOT}/ssh"
 SSH_KNOWN_HOSTS_FILE="${SSH_STATE_DIR}/known_hosts"
+PARALLEL_LOG_ROOT="${PRRW_BOOTSTRAP_STATE_ROOT}/logs"
+PARALLEL_RUN_LOG_DIR=''
+MAX_PARALLEL_WORKER_INSTALLS=4
+MAX_PARALLEL_VLLM_PREPULLS=2
+PARALLEL_FAILURE_TAIL_LINES=40
 MAX_CLOCK_SKEW_SECONDS=5
 NODE_ROLE=''
 KUBELET_NODE_IP=''
@@ -2096,9 +2374,14 @@ declare -a WORKER_ROLES=()
 declare -a WORKER_HOSTNAMES=()
 declare -a GPU_WORKER_INDICES=()
 declare -a LOCAL_TEMP_PATHS=()
+declare -a ACTIVE_PARALLEL_PIDS=()
 SSH_OPTIONS=(-o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=15)
 SCP_OPTIONS=(-o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+PARALLEL_SSH_OPTIONS=(-o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o ServerAliveInterval=15)
+PARALLEL_SCP_OPTIONS=(-o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}" -o StrictHostKeyChecking=yes -o ConnectTimeout=15)
 trap cleanup_local_temp_paths EXIT
+trap 'abort_parallel_worker_jobs INT' INT
+trap 'abort_parallel_worker_jobs TERM' TERM
 
 load_config
 if [[ -z "$KUBELET_NODE_IP" ]]; then
@@ -2185,9 +2468,9 @@ case "$NODE_ROLE" in
       printstyle "Provisioning and joining ${GPU_WORKER_COUNT} GPU backend worker(s) over SSH ...\n" info
       JOIN_COMMAND="$(kubeadm token create --print-join-command) --cri-socket=${CRI_SOCKET}"
       [[ -n "$JOIN_COMMAND" ]] || die 'Failed to create the worker join command.'
-      for index in "${!WORKER_IPS[@]}"; do
-        install_remote_worker "$index" "$JOIN_COMMAND"
-      done
+      run_parallel_worker_jobs \
+        'worker-install' "$MAX_PARALLEL_WORKER_INSTALLS" install_remote_worker "$JOIN_COMMAND" \
+        "${GPU_WORKER_INDICES[@]}"
       verify_cluster
       label_cluster_nodes
       verify_cross_node_network
